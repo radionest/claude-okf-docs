@@ -375,6 +375,41 @@ def check_incoming(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
     return findings, incoming_targets
 
 
+# ---------- log.md structure ----------
+
+LOG_HEADING = re.compile(r"^##\s+(.+?)\s*$")
+
+
+def check_log(log_path: Path, text: str, repo_root: Path) -> list[Finding]:
+    from datetime import date
+
+    findings: list[Finding] = []
+    p = rel(log_path, repo_root)
+    prev: date | None = None
+    in_fence = False
+    for i, line in enumerate(text.splitlines(), 1):
+        if FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = LOG_HEADING.match(line)
+        if not m:
+            continue
+        raw = m.group(1)
+        try:
+            d = date.fromisoformat(raw)
+        except ValueError:
+            findings.append(Finding(p, i, "W4",
+                                    f"log heading '{raw}' is not an ISO date (YYYY-MM-DD)"))
+            continue
+        if prev is not None and d >= prev:
+            findings.append(Finding(p, i, "W4",
+                                    f"log dates out of descending order: {d} appears after {prev}"))
+        prev = d
+    return findings
+
+
 # ---------- checks: frontmatter ----------
 
 def check_page_frontmatter(page: Path, text: str, repo_root: Path) -> list[Finding]:
@@ -433,13 +468,28 @@ def lint_bundle(repo_root: Path, bundle_root: Path) -> list[Finding]:
     for index in indexes:
         if index in texts:
             findings.extend(check_index_frontmatter(index, texts[index], repo_root, bundle_root))
+    for log in logs:
+        if log in texts:
+            findings.extend(check_log(log, texts[log], repo_root))
 
-    link_findings, _linked, _listed = check_bundle_links(
+    link_findings, linked_targets, listed_by_index = check_bundle_links(
         repo_root, bundle_root, texts, pages, indexes, logs)
     findings.extend(link_findings)
 
-    incoming_findings, _incoming = check_incoming(repo_root, bundle_root, texts)
+    incoming_findings, incoming_targets = check_incoming(repo_root, bundle_root, texts)
     findings.extend(incoming_findings)
+
+    referenced = linked_targets | incoming_targets
+    for page_path in pages:
+        if page_path not in texts:
+            continue  # unreadable pages already reported as E1
+        resolved = page_path.resolve()
+        if resolved not in listed_by_index:
+            findings.append(Finding(rel(page_path, repo_root), 1, "W1",
+                                    "page is not listed in any index.md"))
+        if resolved not in referenced:
+            findings.append(Finding(rel(page_path, repo_root), 1, "W2",
+                                    "orphan page: no incoming links from bundle, index, CLAUDE.md or rules"))
 
     findings.sort(key=lambda f: (f.path, f.line, f.code))
     return findings

@@ -406,3 +406,79 @@ def test_e6_incoming_anchor(tmp_path):
     write(tmp_path, "CLAUDE.md", "See [a](docs/kb/a.md#nope).\n")
     fs = run_lint(tmp_path)
     assert codes(fs) == ["E6"]
+
+
+# ---------- graph warnings: W1 / W2 / W4 ----------
+
+def test_w1_page_not_in_any_index(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n",
+        "docs/kb/a.md": page("Links [b](/b.md)."),
+        "docs/kb/b.md": page("text", title="B2"),
+    })
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["W1"]
+    assert fs[0].path == "docs/kb/b.md"
+
+
+def test_w1_subdir_index_counts(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [Sub](sub/) - s.\n",
+        "docs/kb/sub/index.md": "# S\n\n* [C](/sub/c.md) - c.\n",
+        "docs/kb/sub/c.md": page("text", title="C"),
+    })
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_w2_orphan_page(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n",
+        "docs/kb/a.md": page("no outgoing"),
+        "docs/kb/b.md": page("text", title="B2"),
+    })
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["W1", "W2"]
+    assert {f.path for f in fs} == {"docs/kb/b.md"}
+
+
+def test_w2_claude_md_link_prevents_orphan(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n",
+        "docs/kb/a.md": page("no outgoing"),
+        "docs/kb/b.md": page("text", title="B2"),
+        "CLAUDE.md": "See @docs/kb/b.md for details.\n",
+    })
+    assert codes(run_lint(tmp_path)) == ["W1"]
+
+
+def test_w4_non_iso_date(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+        "docs/kb/log.md": "# Log\n\n## July 2, 2026\n* **Update**: x.\n",
+    })
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["W4"]
+    assert "ISO" in fs[0].message and fs[0].line == 3
+
+
+def test_w4_ascending_order(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+        "docs/kb/log.md": "# Log\n\n## 2026-06-01\n* **A**: x.\n\n## 2026-07-02\n* **B**: y.\n",
+    })
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["W4"]
+    assert fs[0].line == 6
+
+
+def test_w4_valid_log_descending(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+        "docs/kb/log.md": "# Log\n\n## 2026-07-02\n* **B**: y.\n\n## 2026-06-01\n* **A**: x.\n",
+    })
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_empty_bundle_only_index_is_clean(tmp_path):
+    make_repo(tmp_path, {"docs/kb/index.md": "# Empty\n"})
+    assert codes(run_lint(tmp_path)) == []
