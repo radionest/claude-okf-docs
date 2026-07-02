@@ -27,7 +27,6 @@ import yaml
 
 DEFAULT_BUNDLE_ROOT = "docs/kb"
 CONFIG_REL = ".claude/okf-docs.json"
-RESERVED = {"index.md", "log.md"}
 FM_DELIM = re.compile(r"^---\s*$")
 
 
@@ -86,7 +85,11 @@ def find_bundle_root(repo_root: Path) -> Path | None:
             data = json.loads(config.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             data = {}
-        rel_root = data.get("bundle_root") or DEFAULT_BUNDLE_ROOT
+        if not isinstance(data, dict):
+            data = {}
+        rel_root = data.get("bundle_root")
+        if not isinstance(rel_root, str) or not rel_root.strip():
+            rel_root = DEFAULT_BUNDLE_ROOT
         bundle = (repo_root / rel_root).resolve()
         if _under_superpowers(bundle, repo_root) or not bundle.is_dir():
             return None
@@ -236,6 +239,8 @@ def target_exists(cand: Path) -> bool:
 
 def check_anchor(src_rel: str, line: int, frag: str, target_file: Path,
                  texts: dict[Path, str], repo_root: Path) -> Finding | None:
+    if not frag:
+        return None
     text = texts.get(target_file)
     if text is None:
         text, error = read_text(target_file)

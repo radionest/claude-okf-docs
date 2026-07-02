@@ -1,5 +1,6 @@
 {
   "name": "nest-dev",
+  "description": "Personal Claude Code marketplace hosting the okf-docs plugin: an OKF v0.1 documentation bundle with a deterministic linter, hooks, commands, and a maintaining-kb skill.",
   "owner": {"name": "radionest"},
   "plugins": [
     {

@@ -47,10 +47,14 @@ def bundle_rel(repo_root: Path) -> str | None:
     config = repo_root / CONFIG_REL
     if config.is_file():
         try:
-            rel_root = json.loads(config.read_text(encoding="utf-8")).get("bundle_root")
+            data = json.loads(config.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            rel_root = None
-        rel_root = rel_root or DEFAULT_BUNDLE_ROOT
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        rel_root = data.get("bundle_root")
+        if not isinstance(rel_root, str) or not rel_root.strip():
+            rel_root = DEFAULT_BUNDLE_ROOT
         if Path(rel_root).parts[:2] == ("docs", "superpowers"):
             return None
         return rel_root if (repo_root / rel_root).is_dir() else None

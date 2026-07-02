@@ -6,8 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 PLUGIN = Path(__file__).resolve().parents[1]
 LINT = PLUGIN / "scripts" / "okf_lint.py"
 
@@ -610,3 +608,31 @@ def test_hooks_json_wires_gate():
     for group in (post, pre):
         cmd = group["hooks"][0]["command"]
         assert "${CLAUDE_PLUGIN_ROOT}/hooks/okf_gate.py" in cmd
+
+
+# ---------- hardening: malformed config / empty anchor ----------
+
+def test_find_bundle_root_non_object_config(tmp_path):
+    make_repo(tmp_path, {".claude/okf-docs.json": '["docs/kb"]',
+                         "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE})
+    assert M.find_bundle_root(tmp_path) == (tmp_path / "docs/kb").resolve()
+
+
+def test_find_bundle_root_non_str_bundle_root(tmp_path):
+    make_repo(tmp_path, {".claude/okf-docs.json": '{"bundle_root": ["x"]}',
+                         "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE})
+    assert M.find_bundle_root(tmp_path) == (tmp_path / "docs/kb").resolve()
+
+
+def test_empty_anchor_not_flagged(tmp_path):
+    make_repo(tmp_path, {"docs/kb/index.md": ROOT_INDEX,
+                         "docs/kb/auth.md": page("Back to [top](#).")})
+    assert [f for f in run_lint(tmp_path) if f.code == "E6"] == []
+
+
+def test_gate_malformed_config_no_traceback(tmp_path):
+    broken_bundle(tmp_path)
+    write(tmp_path, ".claude/okf-docs.json", '["docs/kb"]')
+    r = run_gate(post_edit(tmp_path / "docs/kb/auth.md", tmp_path), tmp_path)
+    assert "Traceback" not in r.stderr
+    assert r.returncode == 2
