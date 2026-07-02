@@ -300,6 +300,81 @@ def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str
     return findings, linked_targets, listed_by_index
 
 
+# ---------- incoming references (CLAUDE.md / .claude/rules) ----------
+
+AT_IMPORT = re.compile(r"(?:^|(?<=\s))@([\w~./][^\s`)\]\"']*)")
+
+
+def extract_at_imports(lines: list[str]) -> list[tuple[int, str]]:
+    found = []
+    for i, line in enumerate(lines, 1):
+        for m in AT_IMPORT.finditer(line):
+            path = m.group(1).rstrip(".,;:!?")
+            if path:
+                found.append((i, path))
+    return found
+
+
+def incoming_files(repo_root: Path) -> list[Path]:
+    files: set[Path] = set()
+    for p in repo_root.rglob("CLAUDE.md"):
+        parts = p.relative_to(repo_root).parts
+        if any(part.startswith(".") for part in parts[:-1]):
+            continue
+        if "node_modules" in parts or parts[:2] == ("docs", "superpowers"):
+            continue
+        files.add(p)
+    rules = repo_root / ".claude" / "rules"
+    if rules.is_dir():
+        files.update(rules.glob("*.md"))
+    return sorted(files)
+
+
+def check_incoming(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
+                   ) -> tuple[list[Finding], set[Path]]:
+    """E4 for broken bundle references in CLAUDE.md/rules; E6 for their anchors."""
+    findings: list[Finding] = []
+    incoming_targets: set[Path] = set()
+
+    for src in incoming_files(repo_root):
+        text, error = read_text(src)
+        if error:
+            continue  # CLAUDE.md health is out of jurisdiction
+        src_rel = rel(src, repo_root)
+        lines = strip_code(text)
+
+        for line_no, target in extract_links(lines):
+            kind, path_part, frag = classify_target(target)
+            if kind != "relative":
+                continue  # external/anchor/leading-'/' have no bundle semantics here
+            cand = (src.parent / path_part).resolve()
+            if not cand.is_relative_to(bundle_root):
+                continue
+            if not target_exists(cand):
+                findings.append(Finding(src_rel, line_no, "E4",
+                                        f"broken reference into bundle: '{target}' does not exist"))
+                continue
+            incoming_targets.add(cand)
+            if frag and cand.is_file() and cand.suffix == ".md":
+                f = check_anchor(src_rel, line_no, frag, cand, texts, repo_root)
+                if f:
+                    findings.append(f)
+
+        for line_no, imp in extract_at_imports(lines):
+            if imp.startswith("~"):
+                continue
+            candidates = [(src.parent / imp).resolve(), (repo_root / imp).resolve()]
+            existing = [c for c in candidates if target_exists(c)]
+            if existing:
+                incoming_targets.update(c for c in existing if c.is_relative_to(bundle_root))
+                continue
+            if any(c.is_relative_to(bundle_root) for c in candidates):
+                findings.append(Finding(src_rel, line_no, "E4",
+                                        f"broken @-import '@{imp}': target does not exist"))
+
+    return findings, incoming_targets
+
+
 # ---------- checks: frontmatter ----------
 
 def check_page_frontmatter(page: Path, text: str, repo_root: Path) -> list[Finding]:
@@ -362,6 +437,9 @@ def lint_bundle(repo_root: Path, bundle_root: Path) -> list[Finding]:
     link_findings, _linked, _listed = check_bundle_links(
         repo_root, bundle_root, texts, pages, indexes, logs)
     findings.extend(link_findings)
+
+    incoming_findings, _incoming = check_incoming(repo_root, bundle_root, texts)
+    findings.extend(incoming_findings)
 
     findings.sort(key=lambda f: (f.path, f.line, f.code))
     return findings

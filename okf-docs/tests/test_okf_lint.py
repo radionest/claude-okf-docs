@@ -333,3 +333,76 @@ def test_slugify_github_style():
     assert M.slugify("Setup & Run") == "setup--run"
     assert M.slugify("Foo `bar` Baz") == "foo-bar-baz"
     assert M.slugify("With_underscore and-dash") == "with_underscore-and-dash"
+
+
+# ---------- incoming references: E4 ----------
+
+def bundle_two_pages(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n* [B2](/b.md) - b.\n",
+        "docs/kb/a.md": page("Links [b](/b.md)."),
+        "docs/kb/b.md": page("text", title="B2"),
+    })
+    return tmp_path
+
+
+def test_e4_root_claude_md_broken_link(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, "CLAUDE.md", "# P\n\nSee [arch](docs/kb/gone.md) and [ok](docs/kb/a.md).\n")
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E4"]
+    assert fs[0].path == "CLAUDE.md" and fs[0].line == 3
+
+
+def test_e4_nested_claude_md_relative(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, "sub/CLAUDE.md",
+          "See [ok](../docs/kb/a.md) and [bad](../docs/kb/gone.md).\n")
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E4"]
+    assert fs[0].path == "sub/CLAUDE.md"
+
+
+def test_e4_rules_file(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, ".claude/rules/arch.md",
+          "Read [a](../../docs/kb/a.md); avoid [x](../../docs/kb/x.md).\n")
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E4"]
+    assert fs[0].path == ".claude/rules/arch.md"
+
+
+def test_e4_at_import_fallback_to_repo_root(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, "sub/CLAUDE.md", "Import @docs/kb/a.md here.\n")
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_e4_at_import_broken(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, "CLAUDE.md", "Import @docs/kb/gone.md.\n")
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E4"]
+    assert "@docs/kb/gone.md" in fs[0].message
+
+
+def test_incoming_skips_external_absolute_home_and_non_bundle(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, "CLAUDE.md",
+          "[web](https://x.y) [abs](/docs/kb/gone.md) [out](README.md) @~/.claude/g.md @README.md\n")
+    write(tmp_path, "README.md", "readme\n")
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_incoming_skips_superpowers_and_node_modules(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, "docs/superpowers/specs/CLAUDE.md", "[bad](../../kb/gone.md)\n")
+    write(tmp_path, "node_modules/pkg/CLAUDE.md", "[bad](../../docs/kb/gone.md)\n")
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_e6_incoming_anchor(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, "CLAUDE.md", "See [a](docs/kb/a.md#nope).\n")
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E6"]
