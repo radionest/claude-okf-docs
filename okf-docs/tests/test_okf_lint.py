@@ -229,3 +229,107 @@ def test_cli_json_format(tmp_path):
     assert data["warnings"] == 1 and data["errors"] == 0
     assert data["findings"][0]["code"] == "W3"
     assert data["findings"][0]["severity"] == "warning"
+
+
+# ---------- bundle-internal links: E3 / E5 / E6 / W5 ----------
+
+def page(body: str, title: str = "P") -> str:
+    return f"---\ntype: Concept\ntitle: {title}\ndescription: d.\n---\n\n{body}\n"
+
+
+def test_e3_broken_absolute_and_relative_links(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n* [C](/sub/c.md) - c.\n",
+        "docs/kb/a.md": page("See [gone](/nope.md) and [also](./missing.md)."),
+        "docs/kb/sub/c.md": page("Up: [ok](../a.md)."),
+    })
+    fs = [f for f in run_lint(tmp_path) if f.code == "E3"]
+    assert len(fs) == 2
+    assert all(f.path == "docs/kb/a.md" for f in fs)
+    assert fs[0].line == 7
+
+
+def test_e3_valid_links_pass(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n* [C](/sub/c.md) - c.\n",
+        "docs/kb/a.md": page("See [c](/sub/c.md) and [c rel](sub/c.md)."),
+        "docs/kb/sub/c.md": page("Up: [a](../a.md), [a abs](/a.md)."),
+    })
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_e3_in_log_md(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": PAGE,
+        "docs/kb/log.md": "# Log\n\n## 2026-07-02\n* **Update**: touched [gone](/gone.md).\n",
+    })
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E3"]
+    assert fs[0].path == "docs/kb/log.md"
+
+
+def test_links_outside_bundle_ignored(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": page("See [src](../../src/app.py) and [web](https://example.com) "
+                                "and [mail](mailto:x@y.z)."),
+        "src/app.py": "print()\n",
+    })
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_links_inside_code_ignored(tmp_path):
+    body = "```md\n[gone](/gone.md)\n```\n\nInline `[gone2](/gone2.md)` too."
+    make_repo(tmp_path, {"docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": page(body)})
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_e5_index_entry_to_missing_file(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [Auth](/auth.md) - a.\n* [Gone](/gone.md) - g.\n",
+        "docs/kb/auth.md": PAGE,
+    })
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E5"]
+    assert fs[0].path == "docs/kb/index.md" and fs[0].line == 4
+
+
+def test_e5_directory_entry_ok(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [Sub](sub/) - subdir.\n* [Auth](/sub/auth.md) - a.\n",
+        "docs/kb/sub/auth.md": PAGE,
+    })
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_e6_broken_anchor(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n* [B2](/b.md) - b.\n",
+        "docs/kb/a.md": page("See [setup](/b.md#setup) and [nope](/b.md#missing-part)."),
+        "docs/kb/b.md": page("# Setup\n\ntext", title="B2"),
+    })
+    fs = [f for f in run_lint(tmp_path) if f.code == "E6"]
+    assert len(fs) == 1
+    assert "#missing-part" in fs[0].message
+
+
+def test_e6_same_file_anchor_and_dedupe(tmp_path):
+    body = "# Part\n\ntext\n\n# Part\n\n[one](#part) [two](#part-1) [bad](#part-2)"
+    make_repo(tmp_path, {"docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": page(body)})
+    fs = [f for f in run_lint(tmp_path) if f.code == "E6"]
+    assert len(fs) == 1 and "#part-2" in fs[0].message
+
+
+def test_w5_wikilink(tmp_path):
+    make_repo(tmp_path, {"docs/kb/index.md": ROOT_INDEX,
+                         "docs/kb/auth.md": page("See [[Other Page]].")})
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["W5"]
+    assert "[[Other Page]]" in fs[0].message
+
+
+def test_slugify_github_style():
+    assert M.slugify("Setup & Run") == "setup--run"
+    assert M.slugify("Foo `bar` Baz") == "foo-bar-baz"
+    assert M.slugify("With_underscore and-dash") == "with_underscore-and-dash"

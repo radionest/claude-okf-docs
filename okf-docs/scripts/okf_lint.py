@@ -154,6 +154,152 @@ def parse_frontmatter(text: str) -> tuple[dict | None, int, str | None, int]:
     return None, len(lines) + 1, "unterminated frontmatter block ('---' never closed)", 1
 
 
+# ---------- links ----------
+
+FENCE = re.compile(r"^\s*(```|~~~)")
+MD_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+WIKILINK = re.compile(r"\[\[[^\]]+\]\]")
+HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
+
+
+def strip_code(text: str) -> list[str]:
+    """Blank fenced blocks and inline code spans; keep the line count."""
+    out: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if FENCE.match(line):
+            in_fence = not in_fence
+            out.append("")
+            continue
+        if in_fence:
+            out.append("")
+            continue
+        out.append(re.sub(r"`[^`]*`", "", line))
+    return out
+
+
+def extract_links(lines: list[str]) -> list[tuple[int, str]]:
+    return [(i, m.group(1))
+            for i, line in enumerate(lines, 1)
+            for m in MD_LINK.finditer(line)]
+
+
+def extract_wikilinks(lines: list[str]) -> list[tuple[int, str]]:
+    return [(i, m.group(0))
+            for i, line in enumerate(lines, 1)
+            for m in WIKILINK.finditer(line)]
+
+
+def classify_target(target: str) -> tuple[str, str, str]:
+    """(kind, path, fragment); kind: external | anchor | absolute | relative."""
+    if SCHEME.match(target) or target.startswith("//"):
+        return "external", "", ""
+    path, _, frag = target.partition("#")
+    if not path:
+        return "anchor", "", frag
+    if path.startswith("/"):
+        return "absolute", path, frag
+    return "relative", path, frag
+
+
+def slugify(text: str) -> str:
+    s = text.strip().lower()
+    s = re.sub(r"[`*]", "", s)
+    s = re.sub(r"[^\w\s-]", "", s)
+    return re.sub(r"\s", "-", s.strip())  # each whitespace char -> '-', GitHub-style
+
+
+def heading_slugs(text: str) -> set[str]:
+    seen: dict[str, int] = {}
+    slugs: set[str] = set()
+    in_fence = False
+    for line in text.splitlines():
+        if FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = HEADING.match(line)
+        if not m:
+            continue
+        base = slugify(m.group(2))
+        n = seen.get(base, 0)
+        seen[base] = n + 1
+        slugs.add(base if n == 0 else f"{base}-{n}")
+    return slugs
+
+
+def target_exists(cand: Path) -> bool:
+    return cand.is_file() or cand.is_dir()
+
+
+def check_anchor(src_rel: str, line: int, frag: str, target_file: Path,
+                 texts: dict[Path, str], repo_root: Path) -> Finding | None:
+    text = texts.get(target_file)
+    if text is None:
+        text, error = read_text(target_file)
+        if error:
+            return None
+        texts[target_file] = text
+    if slugify(frag) in heading_slugs(text):
+        return None
+    return Finding(src_rel, line, "E6",
+                   f"broken anchor '#{frag}' in link to '{rel(target_file, repo_root)}': no such heading")
+
+
+def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
+                       pages: list[Path], indexes: list[Path], logs: list[Path],
+                       ) -> tuple[list[Finding], set[Path], set[Path]]:
+    """Findings E3/E5/E6/W5 + (linked_targets, listed_by_index) resolved sets."""
+    findings: list[Finding] = []
+    linked_targets: set[Path] = set()
+    listed_by_index: set[Path] = set()
+
+    for src in pages + logs + indexes:
+        text = texts.get(src)
+        if text is None:
+            continue
+        src_rel = rel(src, repo_root)
+        is_index = src.name == "index.md"
+        code = "E5" if is_index else "E3"
+        noun = "index entry links to" if is_index else "broken link:"
+        lines = strip_code(text)
+
+        for line_no, raw in extract_wikilinks(lines):
+            findings.append(Finding(src_rel, line_no, "W5",
+                                    f"wikilink '{raw}' is not allowed (use markdown links)"))
+
+        for line_no, target in extract_links(lines):
+            kind, path_part, frag = classify_target(target)
+            if kind == "external":
+                continue
+            if kind == "anchor":
+                f = check_anchor(src_rel, line_no, frag, src, texts, repo_root)
+                if f:
+                    findings.append(f)
+                continue
+            if kind == "absolute":
+                cand = (bundle_root / path_part.lstrip("/")).resolve()
+            else:
+                cand = (src.parent / path_part).resolve()
+            if not cand.is_relative_to(bundle_root):
+                continue  # out of jurisdiction
+            if not target_exists(cand):
+                findings.append(Finding(src_rel, line_no, code,
+                                        f"{noun} '{target}': target does not exist in bundle"))
+                continue
+            linked_targets.add(cand)
+            if is_index:
+                listed_by_index.add(cand)
+            if frag and cand.is_file() and cand.suffix == ".md":
+                f = check_anchor(src_rel, line_no, frag, cand, texts, repo_root)
+                if f:
+                    findings.append(f)
+
+    return findings, linked_targets, listed_by_index
+
+
 # ---------- checks: frontmatter ----------
 
 def check_page_frontmatter(page: Path, text: str, repo_root: Path) -> list[Finding]:
@@ -206,12 +352,16 @@ def lint_bundle(repo_root: Path, bundle_root: Path) -> list[Finding]:
             continue
         texts[f] = text
 
-    for page in pages:
-        if page in texts:
-            findings.extend(check_page_frontmatter(page, texts[page], repo_root))
+    for page_path in pages:
+        if page_path in texts:
+            findings.extend(check_page_frontmatter(page_path, texts[page_path], repo_root))
     for index in indexes:
         if index in texts:
             findings.extend(check_index_frontmatter(index, texts[index], repo_root, bundle_root))
+
+    link_findings, _linked, _listed = check_bundle_links(
+        repo_root, bundle_root, texts, pages, indexes, logs)
+    findings.extend(link_findings)
 
     findings.sort(key=lambda f: (f.path, f.line, f.code))
     return findings
