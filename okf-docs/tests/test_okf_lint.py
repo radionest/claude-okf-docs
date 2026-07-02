@@ -482,3 +482,131 @@ def test_w4_valid_log_descending(tmp_path):
 def test_empty_bundle_only_index_is_clean(tmp_path):
     make_repo(tmp_path, {"docs/kb/index.md": "# Empty\n"})
     assert codes(run_lint(tmp_path)) == []
+
+
+# ---------- hook adapter: okf_gate.py ----------
+
+GATE = PLUGIN / "hooks" / "okf_gate.py"
+
+
+def run_gate(payload: dict, cwd: Path, env_extra: dict | None = None):
+    import os
+    env = dict(os.environ)
+    env.pop("SKIP_OKF_LINT", None)
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(["python3", str(GATE)], input=json.dumps(payload),
+                          capture_output=True, text=True, cwd=str(cwd), env=env)
+
+
+def post_edit(fp: Path, cwd: Path) -> dict:
+    return {"hook_event_name": "PostToolUse", "cwd": str(cwd),
+            "tool_name": "Edit", "tool_input": {"file_path": str(fp)}}
+
+
+def pre_bash(command: str, cwd: Path) -> dict:
+    return {"hook_event_name": "PreToolUse", "cwd": str(cwd),
+            "tool_name": "Bash", "tool_input": {"command": command}}
+
+
+def broken_bundle(tmp_path) -> Path:
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": page("See [gone](/gone.md)."),
+    })
+    return tmp_path
+
+
+def test_gate_noop_when_no_bundle(tmp_path):
+    write(tmp_path, "CLAUDE.md", "# p\n")
+    r = run_gate(post_edit(tmp_path / "CLAUDE.md", tmp_path), tmp_path)
+    assert r.returncode == 0 and r.stdout.strip() == "" and r.stderr.strip() == ""
+
+
+def test_gate_post_edit_bundle_error_exit_2(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(post_edit(tmp_path / "docs/kb/auth.md", tmp_path), tmp_path)
+    assert r.returncode == 2
+    assert "E3" in r.stderr and "docs/kb/auth.md" in r.stderr
+
+
+def test_gate_post_edit_irrelevant_file_noop(tmp_path):
+    broken_bundle(tmp_path)
+    write(tmp_path, "src/app.py", "print()\n")
+    r = run_gate(post_edit(tmp_path / "src/app.py", tmp_path), tmp_path)
+    assert r.returncode == 0 and r.stderr.strip() == ""
+
+
+def test_gate_post_edit_claude_md_and_rules_relevant(tmp_path):
+    broken_bundle(tmp_path)
+    write(tmp_path, "CLAUDE.md", "# p\n")
+    write(tmp_path, ".claude/rules/x.md", "rule\n")
+    assert run_gate(post_edit(tmp_path / "CLAUDE.md", tmp_path), tmp_path).returncode == 2
+    assert run_gate(post_edit(tmp_path / ".claude/rules/x.md", tmp_path), tmp_path).returncode == 2
+
+
+def test_gate_post_edit_warnings_only_exit_0(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": "---\ntype: Concept\n---\nbody\n",  # W3 only
+    })
+    r = run_gate(post_edit(tmp_path / "docs/kb/auth.md", tmp_path), tmp_path)
+    assert r.returncode == 0
+
+
+def test_gate_pr_create_blocked_on_findings(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("gh pr create --fill", tmp_path), tmp_path)
+    assert r.returncode == 0
+    out = json.loads(r.stdout)
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "deny"
+    assert "E3" in hso["permissionDecisionReason"]
+    assert "SKIP_OKF_LINT=1" in hso["permissionDecisionReason"]
+
+
+def test_gate_pr_create_blocked_on_warnings_strict(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": "---\ntype: Concept\n---\nbody\n",  # W3 only
+    })
+    r = run_gate(pre_bash("gh pr create --fill", tmp_path), tmp_path)
+    assert json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_gate_pr_create_clean_passes(tmp_path):
+    make_repo(tmp_path, {"docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE})
+    r = run_gate(pre_bash("gh pr create --fill", tmp_path), tmp_path)
+    assert r.returncode == 0 and r.stdout.strip() == ""
+
+
+def test_gate_pr_create_bypass_env(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("gh pr create --fill", tmp_path), tmp_path,
+                 env_extra={"SKIP_OKF_LINT": "1"})
+    assert r.returncode == 0 and r.stdout.strip() == ""
+
+
+def test_gate_non_pr_and_harmless_commands_noop(tmp_path):
+    broken_bundle(tmp_path)
+    for cmd in ("git status", 'echo "gh pr create"', "gh pr create --dry-run"):
+        r = run_gate(pre_bash(cmd, tmp_path), tmp_path)
+        assert r.returncode == 0 and r.stdout.strip() == "", cmd
+
+
+def test_gate_malformed_payload_noop(tmp_path):
+    broken_bundle(tmp_path)
+    r = subprocess.run(["python3", str(GATE)], input="not json",
+                       capture_output=True, text=True, cwd=str(tmp_path))
+    assert r.returncode == 0
+
+
+def test_hooks_json_wires_gate():
+    hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())
+    post = hooks["hooks"]["PostToolUse"][0]
+    pre = hooks["hooks"]["PreToolUse"][0]
+    assert post["matcher"] == "Edit|Write"
+    assert pre["matcher"] == "Bash"
+    for group in (post, pre):
+        cmd = group["hooks"][0]["command"]
+        assert "${CLAUDE_PLUGIN_ROOT}/hooks/okf_gate.py" in cmd
