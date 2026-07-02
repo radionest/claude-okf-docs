@@ -1,0 +1,11 @@
+{
+  "name": "nest-dev",
+  "owner": {"name": "radionest"},
+  "plugins": [
+    {
+      "name": "okf-docs",
+      "source": "./okf-docs",
+      "description": "Single source of linked project documentation (OKF v0.1 bundle) with a deterministic linter wired into hooks, plus commands and a skill for maintaining pages."
+    }
+  ]
+}

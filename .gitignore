@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+# Superpowers session artifacts (plans, specs, SDD briefs/reports/diffs)
+.superpowers/
+docs/superpowers/

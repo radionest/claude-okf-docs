@@ -1,0 +1,10 @@
+{
+  "name": "okf-docs",
+  "description": "Project documentation as an OKF v0.1 bundle referenced from CLAUDE.md and .claude/rules: deterministic link/frontmatter linter (edit hooks, PR gate, CLI) and commands to init, update, and check the bundle.",
+  "version": "0.1.0",
+  "author": {"name": "radionest"},
+  "license": "MIT",
+  "repository": "https://github.com/radionest/claude-okf-docs",
+  "keywords": ["okf", "documentation", "knowledge-base", "linter", "hooks", "claude-code"],
+  "hooks": "./hooks/hooks.json"
+}
