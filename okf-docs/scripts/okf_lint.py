@@ -91,6 +91,8 @@ def find_bundle_root(repo_root: Path) -> Path | None:
         if not isinstance(rel_root, str) or not rel_root.strip():
             rel_root = DEFAULT_BUNDLE_ROOT
         bundle = (repo_root / rel_root).resolve()
+        if not bundle.is_relative_to(repo_root):
+            return None
         if _under_superpowers(bundle, repo_root) or not bundle.is_dir():
             return None
         return bundle
@@ -234,7 +236,10 @@ def heading_slugs(text: str) -> set[str]:
 
 
 def target_exists(cand: Path) -> bool:
-    return cand.is_file() or cand.is_dir()
+    try:
+        return cand.is_file() or cand.is_dir()
+    except OSError:
+        return False
 
 
 def check_anchor(src_rel: str, line: int, frag: str, target_file: Path,

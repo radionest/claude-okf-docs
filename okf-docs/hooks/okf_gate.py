@@ -12,6 +12,8 @@ Fails open (exit 0): no bundle, no uv on PATH, malformed payload, or linter
 internal error.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -57,7 +59,10 @@ def bundle_rel(repo_root: Path) -> str | None:
             rel_root = DEFAULT_BUNDLE_ROOT
         if Path(rel_root).parts[:2] == ("docs", "superpowers"):
             return None
-        return rel_root if (repo_root / rel_root).is_dir() else None
+        resolved = (repo_root / rel_root).resolve()
+        if not resolved.is_relative_to(repo_root):
+            return None
+        return rel_root if resolved.is_dir() else None
     if (repo_root / DEFAULT_BUNDLE_ROOT / "index.md").is_file():
         return DEFAULT_BUNDLE_ROOT
     return None
@@ -77,18 +82,35 @@ def run_lint(repo_root: Path, strict: bool) -> tuple[int, str]:
     out = r.stdout.strip()
     if r.stderr.strip():
         out = (out + "\n" + r.stderr.strip()).strip()
+    if "okf-lint:" not in out:
+        # uv launched but the linter never emitted its summary line (e.g. it
+        # could not resolve pyyaml offline); the exit code is uv's, not the
+        # linter's contract, so treat it as an internal error and fail open.
+        return 2, out or "okf-lint did not run (uv could not launch the script)"
     return r.returncode, out
 
 
+def _strip_strings(cmd: str) -> str:
+    cmd = re.sub(r"'[^']*'", "", cmd)
+    return re.sub(r'"[^"]*"', "", cmd)
+
+
+ENV_PREFIX = re.compile(r"^(?:\w+=\S*\s+)+")
+SUBSHELL_PREFIX = re.compile(r"^\$?\(\s*")
+
+
 def normalize_command(cmd: str) -> list[str]:
-    no_strings = re.sub(r"'[^']*'", "", cmd)
-    no_strings = re.sub(r'"[^"]*"', "", no_strings)
-    parts = re.split(r"&&|\|\||[;|]", no_strings)
-    return [p.strip() for p in parts if p.strip()]
+    parts = re.split(r"&&|\|\||[;|]", _strip_strings(cmd))
+    out: list[str] = []
+    for part in parts:
+        seg = ENV_PREFIX.sub("", SUBSHELL_PREFIX.sub("", part.strip())).strip()
+        if seg:
+            out.append(seg)
+    return out
 
 
 def is_gh_pr_create(lines: list[str]) -> bool:
-    pattern = re.compile(r"^\s*gh\s+pr\s+create(\s|$)")
+    pattern = re.compile(r"^\s*gh\s+pr\s+create\b")
     return any(pattern.search(line) for line in lines)
 
 
@@ -97,18 +119,25 @@ def is_harmless_variant(lines: list[str]) -> bool:
     return any(pattern.search(line) for line in lines)
 
 
+def has_inline_skip(cmd: str) -> bool:
+    return re.search(r"\bSKIP_OKF_LINT=1\b", _strip_strings(cmd)) is not None
+
+
 def relevant_file(fp: str, repo_root: Path, bundle: str) -> bool:
     p = Path(fp)
     if not p.is_absolute():
         p = repo_root / p
     try:
-        rel_path = p.resolve().relative_to(repo_root)
+        resolved = p.resolve()
+        rel_path = resolved.relative_to(repo_root)
     except (ValueError, OSError):
         return False
-    rp = rel_path.as_posix()
-    return (rel_path.name == "CLAUDE.md"
-            or rp.startswith(".claude/rules/")
-            or rp == bundle or rp.startswith(bundle + "/"))
+    if rel_path.name == "CLAUDE.md" or rel_path.as_posix().startswith(".claude/rules/"):
+        return True
+    try:
+        return resolved.is_relative_to((repo_root / bundle).resolve())
+    except (ValueError, OSError):
+        return False
 
 
 def handle_post_tool_use(payload: dict, repo_root: Path, bundle: str) -> int:
@@ -132,7 +161,7 @@ def handle_pre_tool_use(payload: dict, repo_root: Path) -> int:
     lines = normalize_command(command)
     if not is_gh_pr_create(lines) or is_harmless_variant(lines):
         return 0
-    if os.environ.get("SKIP_OKF_LINT") == "1":
+    if os.environ.get("SKIP_OKF_LINT") == "1" or has_inline_skip(command):
         return 0
     rc, out = run_lint(repo_root, strict=True)
     if rc == 2:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[1]
 LINT = PLUGIN / "scripts" / "okf_lint.py"
+GATE = PLUGIN / "hooks" / "okf_gate.py"
 
 
 def load_lint():
@@ -19,6 +20,17 @@ def load_lint():
 
 
 M = load_lint()
+
+
+def load_gate():
+    spec = importlib.util.spec_from_file_location("okf_gate", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+G = load_gate()
 
 
 def write(root: Path, rel_path: str, content: str) -> Path:
@@ -484,8 +496,6 @@ def test_empty_bundle_only_index_is_clean(tmp_path):
 
 # ---------- hook adapter: okf_gate.py ----------
 
-GATE = PLUGIN / "hooks" / "okf_gate.py"
-
 
 def run_gate(payload: dict, cwd: Path, env_extra: dict | None = None):
     import os
@@ -636,3 +646,109 @@ def test_gate_malformed_config_no_traceback(tmp_path):
     r = run_gate(post_edit(tmp_path / "docs/kb/auth.md", tmp_path), tmp_path)
     assert "Traceback" not in r.stderr
     assert r.returncode == 2
+
+
+# ---------- review fixes: gate fail-open, robustness, matching, containment ----------
+
+def test_gate_run_lint_failopen_without_linter_marker(monkeypatch, tmp_path):
+    import types
+    monkeypatch.setattr(G.shutil, "which", lambda _name: "/usr/bin/uv")
+    fake = types.SimpleNamespace(
+        returncode=1,
+        stdout="x No solution found when resolving script dependencies: pyyaml",
+        stderr="")
+    monkeypatch.setattr(G.subprocess, "run", lambda *a, **k: fake)
+    rc, _out = G.run_lint(tmp_path, strict=False)
+    assert rc == 2  # uv failed to launch the linter -> fail open, not "errors"
+
+
+def test_gate_run_lint_trusts_exit1_with_marker(monkeypatch, tmp_path):
+    import types
+    monkeypatch.setattr(G.shutil, "which", lambda _name: "/usr/bin/uv")
+    fake = types.SimpleNamespace(
+        returncode=1,
+        stdout="docs/kb/a.md:7: E3 broken\nokf-lint: 1 errors, 0 warnings in docs/kb",
+        stderr="")
+    monkeypatch.setattr(G.subprocess, "run", lambda *a, **k: fake)
+    rc, _out = G.run_lint(tmp_path, strict=False)
+    assert rc == 1
+
+
+def test_target_exists_survives_oserror():
+    assert M.target_exists(Path("/" + "a" * 5000 + ".md")) is False
+
+
+def test_cli_overlong_link_is_e3_not_internal_error(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n",
+        "docs/kb/a.md": page("See [bad](/" + "a" * 500 + ".md)."),
+    })
+    r = run_cli(tmp_path, "--root", str(tmp_path))
+    assert r.returncode == 1  # was 2 (internal error) before the OSError guard
+    assert "E3" in r.stdout
+
+
+def test_gate_detects_env_prefixed_and_subshell_pr_create():
+    assert G.is_gh_pr_create(G.normalize_command("GH_TOKEN=x gh pr create")) is True
+    assert G.is_gh_pr_create(G.normalize_command("FOO=1 BAR=2 gh pr create --fill")) is True
+    assert G.is_gh_pr_create(G.normalize_command("(gh pr create --fill)")) is True
+    assert G.is_gh_pr_create(G.normalize_command("gh pr create")) is True
+    assert G.is_gh_pr_create(G.normalize_command("git status")) is False
+
+
+def test_gate_has_inline_skip():
+    assert G.has_inline_skip("SKIP_OKF_LINT=1 gh pr create") is True
+    assert G.has_inline_skip('gh pr create --title "SKIP_OKF_LINT=1"') is False
+    assert G.has_inline_skip("gh pr create") is False
+
+
+def test_gate_pr_create_blocked_env_prefixed(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("GH_TOKEN=x gh pr create --fill", tmp_path), tmp_path)
+    assert json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_gate_pr_create_inline_skip_bypass(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("SKIP_OKF_LINT=1 gh pr create --fill", tmp_path), tmp_path)
+    assert r.returncode == 0 and r.stdout.strip() == ""
+
+
+def test_find_bundle_root_rejects_relative_outside_repo(tmp_path):
+    outside = tmp_path.parent / "outside_secret"
+    outside.mkdir(exist_ok=True)
+    (outside / "leak.md").write_text("secret\n", encoding="utf-8")
+    make_repo(tmp_path, {".claude/okf-docs.json": '{"bundle_root": "../outside_secret"}'})
+    assert M.find_bundle_root(tmp_path) is None
+
+
+def test_find_bundle_root_rejects_absolute_outside_repo(tmp_path):
+    make_repo(tmp_path, {".claude/okf-docs.json": '{"bundle_root": "/etc"}'})
+    assert M.find_bundle_root(tmp_path) is None
+
+
+def test_gate_bundle_rel_rejects_outside_repo(tmp_path):
+    outside = tmp_path.parent / "outside_secret2"
+    outside.mkdir(exist_ok=True)
+    make_repo(tmp_path, {".claude/okf-docs.json": '{"bundle_root": "../outside_secret2"}'})
+    assert G.bundle_rel(tmp_path.resolve()) is None
+
+
+def test_relevant_file_normalizes_bundle_spelling(tmp_path):
+    repo = tmp_path.resolve()
+    (repo / "docs/kb").mkdir(parents=True)
+    f = repo / "docs/kb/auth.md"
+    for spelling in ("docs/kb", "docs/kb/", "./docs/kb"):
+        assert G.relevant_file(str(f), repo, spelling) is True, spelling
+    assert G.relevant_file(str(repo / "src/app.py"), repo, "docs/kb") is False
+
+
+def test_gate_post_edit_relevant_with_trailing_slash_config(tmp_path):
+    broken_bundle(tmp_path)
+    write(tmp_path, ".claude/okf-docs.json", '{"bundle_root": "docs/kb/"}')
+    r = run_gate(post_edit(tmp_path / "docs/kb/auth.md", tmp_path), tmp_path)
+    assert r.returncode == 2  # feedback fires; was a silent no-op before the fix
+
+
+def test_gate_has_future_annotations():
+    assert "from __future__ import annotations" in GATE.read_text(encoding="utf-8")
