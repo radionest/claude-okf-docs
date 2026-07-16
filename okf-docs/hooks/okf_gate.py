@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -90,37 +91,207 @@ def run_lint(repo_root: Path, strict: bool) -> tuple[int, str]:
     return r.returncode, out
 
 
-def _strip_strings(cmd: str) -> str:
-    cmd = re.sub(r"'[^']*'", "", cmd)
-    return re.sub(r'"[^"]*"', "", cmd)
+_ASSIGN = re.compile(r"^\w+=")
+SKIP_TOKEN = "SKIP_OKF_LINT=1"
+# Transparent prefixes that run their trailing argv as the real command.
+_WRAPPERS = {"env", "command"}
+# env option flags that consume a value: short (`-u NAME`/`-uNAME`) and long.
+_WRAPPER_VALUE_SHORT = "uC"
+_WRAPPER_VALUE_LONG = {"--unset", "--chdir"}
+# Cap on `env -S`/`--split-string` unwrap recursion (crafted deep nests fail closed).
+_MAX_UNWRAP = 24
+# `gh pr create` flags that consume the next token as a value, so a value that
+# happens to look like --help/--dry-run is not mistaken for that flag.
+_VALUE_FLAGS = {"-t", "--title", "-b", "--body", "-F", "--body-file",
+                "-H", "--head", "-B", "--base", "-l", "--label", "-a", "--assignee",
+                "-r", "--reviewer", "-m", "--milestone", "-p", "--project",
+                "-T", "--template"}
+_HARMLESS_FLAGS = {"--help", "-h", "--dry-run"}
 
 
-ENV_PREFIX = re.compile(r"^(?:\w+=\S*\s+)+")
-SUBSHELL_PREFIX = re.compile(r"^\$?\(\s*")
+def _split_statements(cmd: str) -> list[str]:
+    """Quote/escape-aware split of a shell command into statement strings.
+
+    Statements break on unquoted `; & | && ||` and newlines and around `( )`;
+    unquoted `#` comments are dropped; quoted newlines (multi-line `--body`,
+    `"$(… )"`) stay inside their statement. Redirections — including here-docs
+    and here-strings (`<<`, `<<<`) — are left inline as ordinary tokens, so a
+    here-doc body is parsed as commands too: the gate over-matches rather than
+    ever failing open. Total and best-effort — malformed input never raises.
+    """
+    statements: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    continued = False
+
+    def flush() -> None:
+        s = "".join(cur).strip()
+        if s:
+            statements.append(s)
+        cur.clear()
+
+    for line in cmd.split("\n"):
+        if quote is not None:
+            cur.append("\n")  # a newline inside an open quote is literal
+        i, length = 0, len(line)
+        while i < length:
+            c = line[i]
+            if quote is not None:
+                cur.append(c)
+                if c == quote:
+                    quote = None
+                elif c == "\\" and quote == '"' and i + 1 < length:
+                    cur.append(line[i + 1])
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if c == "\\":
+                if i + 1 < length:
+                    cur.append(c)
+                    cur.append(line[i + 1])
+                    i += 2
+                else:
+                    continued = True
+                    cur.append(" ")
+                    i += 1
+                continue
+            if c in "'\"":
+                quote = c
+                cur.append(c)
+                i += 1
+                continue
+            if c == "#" and (i == 0 or line[i - 1] in " \t"):
+                break  # comment runs to end of line
+            if c in "&|;()":
+                flush()
+                i += 2 if line[i:i + 2] in ("&&", "||") else 1
+                continue
+            cur.append(c)
+            i += 1
+        if quote is not None:
+            continue  # statement continues on the next physical line
+        if continued:
+            continued = False
+            continue
+        flush()
+    flush()
+    return statements
 
 
-def normalize_command(cmd: str) -> list[str]:
-    parts = re.split(r"&&|\|\||[;|]", _strip_strings(cmd))
-    out: list[str] = []
-    for part in parts:
-        seg = ENV_PREFIX.sub("", SUBSHELL_PREFIX.sub("", part.strip())).strip()
-        if seg:
-            out.append(seg)
-    return out
+def _split_argv(stmt: str) -> list[str]:
+    """Tokenize one statement into argv; on unbalanced quotes fall back to a
+    naive split so a malformed `gh pr create` still fails closed."""
+    try:
+        return shlex.split(stmt, posix=True)
+    except ValueError:
+        return stmt.split()
 
 
-def is_gh_pr_create(lines: list[str]) -> bool:
-    pattern = re.compile(r"^\s*gh\s+pr\s+create\b")
-    return any(pattern.search(line) for line in lines)
+def normalize_command(cmd: str) -> list[list[str]]:
+    """Shell command -> statements, each a list of argv word tokens."""
+    return [_split_argv(stmt) for stmt in _split_statements(cmd)]
 
 
-def is_harmless_variant(lines: list[str]) -> bool:
-    pattern = re.compile(r"^\s*gh\s+pr\s+create\b.*(--help|--dry-run)")
-    return any(pattern.search(line) for line in lines)
+def _command_words(words: list[str], _depth: int = 0) -> tuple[list[str], list[str]]:
+    """Split a statement into (leading VAR=val assignments, the actual argv).
+
+    Strips transparent wrappers (`env`, `command`) and their option flags —
+    including bundled short clusters (`env -iS ...`, `env -iu NAME`) — so the
+    real argv[0] is exposed. `env -S "<cmd>"` / `--split-string` is re-tokenized
+    (its value is itself the command) and recursed, bounded by _MAX_UNWRAP so a
+    crafted deep nest fails closed rather than overflowing the stack.
+    """
+    i = 0
+    assigns: list[str] = []
+    while i < len(words):
+        w = words[i]
+        if _ASSIGN.match(w):
+            assigns.append(w)
+            i += 1
+            continue
+        if w not in _WRAPPERS and w.rpartition("/")[2] not in _WRAPPERS:
+            break
+        i += 1  # skip the wrapper name
+        while i < len(words) and words[i].startswith("-") and words[i] != "-":
+            tok = words[i]
+            split_val = None      # re-tokenized command from -S/--split-string
+            consume_next = False  # option takes the following word as its value
+            if tok.startswith("--"):
+                name, sep, val = tok.partition("=")
+                if name == "--split-string":
+                    split_val = (_split_argv(val) + words[i + 1:]) if sep else \
+                        ((_split_argv(words[i + 1]) if i + 1 < len(words) else []) + words[i + 2:])
+                elif name in _WRAPPER_VALUE_LONG and not sep:
+                    consume_next = True
+            else:
+                for j, c in enumerate(tok[1:]):
+                    if c == "S":
+                        rest = tok[2 + j:]
+                        split_val = (_split_argv(rest) + words[i + 1:]) if rest else \
+                            ((_split_argv(words[i + 1]) if i + 1 < len(words) else []) + words[i + 2:])
+                        break
+                    if c in _WRAPPER_VALUE_SHORT:
+                        consume_next = not tok[2 + j:]  # next word only if no attached value
+                        break
+            if split_val is not None:
+                if _depth >= _MAX_UNWRAP:
+                    return assigns, ["gh", "pr", "create"]  # runaway nesting -> fail closed
+                inner_assigns, inner_argv = _command_words(split_val, _depth + 1)
+                return assigns + inner_assigns, inner_argv
+            i += 1
+            if consume_next and i < len(words):
+                i += 1  # skip the option's value word
+    return assigns, words[i:]
+
+
+def _argv_is_pr_create(argv: list[str]) -> bool:
+    if not argv or (argv[0] != "gh" and argv[0].rpartition("/")[2] != "gh"):
+        return False
+    rest = argv[1:]
+    return any(rest[k] == "pr" and rest[k + 1] == "create" for k in range(len(rest) - 1))
+
+
+def _is_pr_create(words: list[str]) -> bool:
+    return _argv_is_pr_create(_command_words(words)[1])
+
+
+def is_gh_pr_create(segments: list[list[str]]) -> bool:
+    return any(_is_pr_create(seg) for seg in segments)
+
+
+def _is_harmless(argv: list[str]) -> bool:
+    """True iff argv carries --help/-h/--dry-run as a real flag (not a flag value)."""
+    expect_value = False
+    for tok in argv:
+        if expect_value:
+            expect_value = False
+        elif tok in _VALUE_FLAGS:
+            expect_value = True
+        elif tok in _HARMLESS_FLAGS:
+            return True
+    return False
 
 
 def has_inline_skip(cmd: str) -> bool:
-    return re.search(r"\bSKIP_OKF_LINT=1\b", _strip_strings(cmd)) is not None
+    """True iff a real `gh pr create` carries SKIP_OKF_LINT=1 as its own env prefix."""
+    for seg in normalize_command(cmd):
+        assigns, argv = _command_words(seg)
+        if _argv_is_pr_create(argv) and SKIP_TOKEN in assigns:
+            return True
+    return False
+
+
+def gated_pr_create(cmd: str) -> bool:
+    """True iff the command runs a real `gh pr create` that must pass the lint gate."""
+    try:
+        for seg in normalize_command(cmd):
+            assigns, argv = _command_words(seg)
+            if _argv_is_pr_create(argv) and SKIP_TOKEN not in assigns and not _is_harmless(argv):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 -- any parser failure fails closed (treat as gated)
+        return True
 
 
 def relevant_file(fp: str, repo_root: Path, bundle: str) -> bool:
@@ -158,10 +329,9 @@ def handle_pre_tool_use(payload: dict, repo_root: Path) -> int:
     command = (payload.get("tool_input") or {}).get("command", "")
     if not command:
         return 0
-    lines = normalize_command(command)
-    if not is_gh_pr_create(lines) or is_harmless_variant(lines):
+    if os.environ.get("SKIP_OKF_LINT") == "1":
         return 0
-    if os.environ.get("SKIP_OKF_LINT") == "1" or has_inline_skip(command):
+    if not gated_pr_create(command):
         return 0
     rc, out = run_lint(repo_root, strict=True)
     if rc == 2:
