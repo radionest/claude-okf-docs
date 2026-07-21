@@ -752,3 +752,194 @@ def test_gate_post_edit_relevant_with_trailing_slash_config(tmp_path):
 
 def test_gate_has_future_annotations():
     assert "from __future__ import annotations" in GATE.read_text(encoding="utf-8")
+
+
+# ---------- review fixes: PR-gate command matching ----------
+
+def _denied(r) -> bool:
+    return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_gate_matcher_detects_real_pr_create_variants():
+    for cmd in (
+        "gh pr create",
+        "gh pr create --fill",
+        "gh -R owner/repo pr create --fill",
+        "gh --repo owner/repo pr create",
+        "env GH_TOKEN=x gh pr create --fill",
+        "/usr/bin/gh pr create",
+        "git push -u origin feat\ngh pr create --fill",
+        "sleep 1 & gh pr create --fill",
+        "(gh pr create --fill)",
+    ):
+        assert G.is_gh_pr_create(G.normalize_command(cmd)) is True, cmd
+
+
+def test_gate_matcher_ignores_non_pr_create():
+    for cmd in (
+        "git status",
+        'echo "gh pr create"',
+        'git commit -m "gh pr create"',
+    ):
+        assert G.is_gh_pr_create(G.normalize_command(cmd)) is False, cmd
+
+
+def test_gate_inline_skip_only_as_env_prefix_of_pr_create():
+    assert G.has_inline_skip("SKIP_OKF_LINT=1 gh pr create --fill") is True
+    assert G.has_inline_skip("gh pr create --fill  # SKIP_OKF_LINT=1") is False
+    assert G.has_inline_skip("echo SKIP_OKF_LINT=1 && gh pr create --fill") is False
+    assert G.has_inline_skip("git config x SKIP_OKF_LINT=1; gh pr create --fill") is False
+    assert G.has_inline_skip('gh pr create --title "SKIP_OKF_LINT=1"') is False
+
+
+def test_gate_newline_separated_pr_create_is_blocked(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("git push -u origin feat\ngh pr create --fill", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_flag_before_subcommand_is_blocked(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("gh -R owner/repo pr create --fill", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_chained_harmless_then_real_create_is_blocked(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("gh pr create --dry-run && gh pr create --fill", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_help_substring_is_not_harmless(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("gh pr create --fill --label help-wanted--help", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_skip_token_in_comment_does_not_bypass(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("gh pr create --fill  # SKIP_OKF_LINT=1", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_skip_token_on_other_segment_does_not_bypass(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("echo SKIP_OKF_LINT=1 && gh pr create --fill", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_quoted_pr_create_literal_is_not_a_command(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash('echo "\\" && gh pr create"', tmp_path), tmp_path)
+    assert r.returncode == 0 and r.stdout.strip() == ""
+
+
+# ---------- pre-PR review fixes: shell-accurate, fail-closed matching ----------
+
+def test_gate_matcher_handles_quoted_newlines_and_wrappers():
+    assert G.is_gh_pr_create(G.normalize_command('gh pr create --body "a\nb"')) is True
+    assert G.is_gh_pr_create(G.normalize_command("command gh pr create")) is True
+    # --dry-run as an option VALUE (not a flag) must not clear the gate:
+    assert G.gated_pr_create('gh pr create --title "--dry-run" --fill') is True
+    # a genuine --dry-run flag is harmless:
+    assert G.gated_pr_create("gh pr create --dry-run") is False
+
+
+def test_gate_multiline_body_is_still_gated(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash('gh pr create --title "T" --body "line one\nline two"', tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_body_with_command_substitution_heredoc_is_gated(tmp_path):
+    broken_bundle(tmp_path)
+    cmd = ('gh pr create --fill --body "$(cat <<\'EOF\'\n'
+           'hello\n'
+           'EOF\n'
+           ')"')
+    r = run_gate(pre_bash(cmd, tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_unbalanced_quote_fails_closed(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash('gh pr create --title "unterminated', tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_midword_hash_is_not_a_comment(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("echo x#y && gh pr create --fill", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_quoted_heredoc_marker_does_not_hide_pr_create(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash('echo "see << STOP"\ngh pr create --fill\nSTOP', tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_harmless_flag_as_option_value_is_gated(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash('gh pr create --title "-h" --fill', tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_command_wrapper_is_gated(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("command gh pr create --fill", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_here_string_does_not_hide_following_pr_create(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash('jq . <<< "$response"\ngh pr create --fill', tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_env_option_flags_do_not_shield_command(tmp_path):
+    broken_bundle(tmp_path)
+    for cmd in ("env -i gh pr create --fill",
+                "env -u FOO gh pr create --fill",
+                "env -C /tmp gh pr create --fill"):
+        r = run_gate(pre_bash(cmd, tmp_path), tmp_path)
+        assert _denied(r), cmd
+
+
+def test_gate_env_split_string_is_gated(tmp_path):
+    broken_bundle(tmp_path)
+    for cmd in ("env -S 'gh pr create --title x'",
+                "env --split-string='gh pr create'",
+                "env -u FOO -C /tmp -S 'gh pr create --fill'",
+                "env -S 'FOO=bar gh pr create'"):
+        r = run_gate(pre_bash(cmd, tmp_path), tmp_path)
+        assert _denied(r), cmd
+
+
+def test_gate_env_bundled_short_options_are_gated(tmp_path):
+    broken_bundle(tmp_path)
+    for cmd in ("env -iS 'gh pr create --fill'",     # bundled -i + -S
+                "env -viS 'gh pr create'",           # bundled -v -i -S
+                "env -iu FOO gh pr create --fill",   # bundled -i + -u FOO
+                "env -uFOO gh pr create --fill"):    # -u with attached value
+        r = run_gate(pre_bash(cmd, tmp_path), tmp_path)
+        assert _denied(r), cmd
+
+
+def test_gate_nested_env_split_string_is_gated(tmp_path):
+    broken_bundle(tmp_path)
+    r = run_gate(pre_bash("env -S \"env -S 'gh pr create --fill'\"", tmp_path), tmp_path)
+    assert _denied(r)
+
+
+def test_gate_command_words_depth_cap_fails_closed():
+    # at the unwrap cap the -S branch returns a synthetic gh-pr-create (stays gated,
+    # so a crafted deep `env -S` nest can't overflow the stack into an exit-1 bypass)
+    assert G._command_words(["env", "-S", "env -S x"], _depth=G._MAX_UNWRAP) == ([], ["gh", "pr", "create"])
+
+
+def test_gate_parser_error_fails_closed(monkeypatch):
+    def boom(_cmd):
+        raise RuntimeError("parser blew up")
+    monkeypatch.setattr(G, "normalize_command", boom)
+    assert G.gated_pr_create("gh pr create") is True
