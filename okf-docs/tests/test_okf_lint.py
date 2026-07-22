@@ -469,6 +469,17 @@ def test_e4_ignores_rules_frontmatter_closer_on_last_line(tmp_path):
     assert [f for f in run_lint(tmp_path) if f.code == "E4"] == []
 
 
+def test_rules_frontmatter_reference_does_not_prevent_orphan(tmp_path):
+    # A link inside frontmatter is metadata, not a reference, so it must not
+    # keep a page out of W2. Intended consequence of body scoping.
+    make_repo(tmp_path, {"docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+                         "docs/kb/orphan.md": PAGE})
+    write(tmp_path, ".claude/rules/arch.md",
+          '---\ndescription: "see [o](../../docs/kb/orphan.md)"\n---\n\nBody.\n')
+    assert codes([f for f in run_lint(tmp_path) if f.path == "docs/kb/orphan.md"]) \
+        == ["W1", "W2"]
+
+
 def test_e4_at_import_fallback_to_repo_root(tmp_path):
     bundle_two_pages(tmp_path)
     write(tmp_path, "sub/CLAUDE.md", "Import @docs/kb/a.md here.\n")
