@@ -137,6 +137,8 @@ def parse_frontmatter(text: str) -> tuple[dict | None, int, str | None, int]:
 
     meta is None when there is no frontmatter block at all; error is set when
     a block opener exists but the block is unterminated or not a YAML mapping.
+    body_start_line is 1 unless a *closed* block was found, so body checks scan
+    a file with a dangling '---' in full rather than discarding all of it.
     """
     lines = text.splitlines()
     if not lines or not FM_DELIM.match(lines[0]):
@@ -156,7 +158,7 @@ def parse_frontmatter(text: str) -> tuple[dict | None, int, str | None, int]:
             if not isinstance(meta, dict):
                 return None, i + 2, "frontmatter is not a YAML mapping", 2
             return meta, i + 2, None, 1
-    return None, len(lines) + 1, "unterminated frontmatter block ('---' never closed)", 1
+    return None, 1, "unterminated frontmatter block ('---' never closed)", 1
 
 
 def body_text(text: str) -> str:
@@ -167,13 +169,11 @@ def body_text(text: str) -> str:
     blanked rather than removed, so body findings keep absolute line numbers
     (trailing blank lines may collapse, which no check depends on).
     """
-    lines = text.splitlines()
-    meta, start, _, _ = parse_frontmatter(text)
+    start = parse_frontmatter(text)[1]
     if start <= 1:
-        return text  # no frontmatter block at all
-    if meta is None and start > len(lines):
-        return text  # '---' never closed: not a block, so the file is all body
-    return "\n".join("" if i < start else line for i, line in enumerate(lines, 1))
+        return text  # no closed block: nothing is frontmatter, the file is body
+    return "\n".join("" if i < start else line
+                     for i, line in enumerate(text.splitlines(), 1))
 
 
 # ---------- links ----------

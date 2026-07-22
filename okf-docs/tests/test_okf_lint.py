@@ -383,6 +383,31 @@ def test_unterminated_frontmatter_does_not_blank_body(tmp_path):
     assert fs[0].line == 6 and "ISO" in fs[0].message
 
 
+def test_body_text_branches():
+    # no frontmatter at all: unchanged
+    assert M.body_text("# H\n\ntext\n") == "# H\n\ntext\n"
+    # valid block: frontmatter blanked, body keeps its absolute line number
+    valid = M.body_text("---\nt: 1\n---\n\n# H\n").splitlines()
+    assert valid[:4] == ["", "", "", ""] and valid[4] == "# H"
+    # '---' never closed: not a block, so the whole file is body
+    assert M.body_text("---\nt: 1\n\n# H\n") == "---\nt: 1\n\n# H\n"
+    # bad YAML, closer mid-file: still a block
+    assert M.body_text("---\nt: [bad\n---\n\n# H\n").splitlines()[4] == "# H"
+    # bad YAML, closer on the last line: still a block, nothing survives
+    assert M.body_text("---\nt: [bad\n---\n").strip() == ""
+
+
+def test_bad_yaml_with_closer_on_last_line_is_still_frontmatter(tmp_path):
+    # No body line follows the closing '---', but the block is still
+    # frontmatter, so its values must not be scanned as body markdown.
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": "---\ntype: Concept\ntitle: Auth: the basics\n"
+                           'description: "see [x](/gone.md) and [[Wiki]]"\n---\n',
+    })
+    assert codes(run_lint(tmp_path)) == ["E1"]  # the YAML error, nothing else
+
+
 def test_slugify_github_style():
     assert M.slugify("Setup & Run") == "setup--run"
     assert M.slugify("Foo `bar` Baz") == "foo-bar-baz"
@@ -431,6 +456,16 @@ def test_e4_ignores_rules_frontmatter(tmp_path):
     write(tmp_path, ".claude/rules/arch.md",
           '---\ndescription: "see [gone](../../docs/kb/nope.md)"\n---\n\n'
           "Read [a](../../docs/kb/a.md).\n")
+    assert [f for f in run_lint(tmp_path) if f.code == "E4"] == []
+
+
+def test_e4_ignores_rules_frontmatter_closer_on_last_line(tmp_path):
+    # Rules files get no E1, so a bogus E4 here would fail --strict with no
+    # diagnostic explaining it.
+    bundle_two_pages(tmp_path)
+    write(tmp_path, ".claude/rules/arch.md",
+          "---\ntitle: Arch: rules\n"
+          'description: "see [gone](../../docs/kb/nope.md)"\n---\n')
     assert [f for f in run_lint(tmp_path) if f.code == "E4"] == []
 
 
