@@ -339,6 +339,89 @@ def test_w5_wikilink(tmp_path):
     assert "[[Other Page]]" in fs[0].message
 
 
+def test_frontmatter_value_is_not_a_body_link(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": '---\ntype: Concept\ntitle: A\n'
+                           'description: "see [x](/gone.md)"\n---\n\n# A\n\nbody\n',
+    })
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_frontmatter_value_is_not_a_wikilink(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": '---\ntype: Concept\ntitle: A\n'
+                           'description: "see [[Other Page]]"\n---\n\n# A\n\nbody\n',
+    })
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_frontmatter_comment_is_not_a_heading(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n* [B](/b.md) - b.\n",
+        "docs/kb/a.md": page("Link [s](/b.md#setup)."),
+        "docs/kb/b.md": '---\ntype: Concept\ntitle: B\ndescription: d.\n'
+                        '# Setup\n---\n\n# Real\n\nx\n',
+    })
+    # #setup is broken: b.md has no "Setup" heading, only a YAML comment.
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E6"]
+    assert fs[0].path == "docs/kb/a.md" and fs[0].line == 7
+    assert "#setup" in fs[0].message
+
+
+def test_unterminated_frontmatter_does_not_blank_body(tmp_path):
+    # A '---' that never closes is not a frontmatter block; log.md has no E1
+    # path, so blanking it would drop every finding with no diagnostic.
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+        "docs/kb/log.md": "---\ntitle: Log\n\n# Log\n\n## not-a-date\n* **B**: y.\n",
+    })
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["W4"]
+    assert fs[0].line == 6 and "ISO" in fs[0].message
+
+
+def test_fm_end():
+    # a '---' with no opener above it is a thematic break, not a closer
+    assert M._fm_end(["# H", "---", "text"]) == -1
+    # the FIRST closer ends the block; a later '---' is body
+    assert M._fm_end(["---", "a: 1", "---", "text", "---"]) == 2
+    # opener never closed
+    assert M._fm_end(["---", "a: 1", "text"]) == -1
+    assert M._fm_end(["---"]) == -1
+    assert M._fm_end([]) == -1
+    # closer on the final line
+    assert M._fm_end(["---", "a: 1", "---"]) == 2
+
+
+def test_body_lines_branches():
+    # no frontmatter at all: unchanged
+    assert M.body_lines("# H\n\ntext\n") == ["# H", "", "text"]
+    # valid block: frontmatter blanked, body keeps its absolute line number
+    assert M.body_lines("---\nt: 1\n---\n\n# H\n") == ["", "", "", "", "# H"]
+    # body on the line right after the closer: nothing blanked past it
+    assert M.body_lines("---\nt: 1\n---\n# H\n") == ["", "", "", "# H"]
+    # '---' never closed: not a block, so the whole file is body
+    assert M.body_lines("---\nt: 1\n\n# H\n") == ["---", "t: 1", "", "# H"]
+    # bad YAML, closer mid-file: still a block
+    assert M.body_lines("---\nt: [bad\n---\n\n# H\n") == ["", "", "", "", "# H"]
+    # bad YAML, closer on the last line: still a block, nothing survives
+    assert M.body_lines("---\nt: [bad\n---\n") == ["", "", ""]
+
+
+def test_bad_yaml_with_closer_on_last_line_is_still_frontmatter(tmp_path):
+    # No body line follows the closing '---', but the block is still
+    # frontmatter, so its values must not be scanned as body markdown.
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": "---\ntype: Concept\ntitle: Auth: the basics\n"
+                           'description: "see [x](/gone.md) and [[Wiki]]"\n---\n',
+    })
+    assert codes(run_lint(tmp_path)) == ["E1"]  # the YAML error, nothing else
+
+
 def test_slugify_github_style():
     assert M.slugify("Setup & Run") == "setup--run"
     assert M.slugify("Foo `bar` Baz") == "foo-bar-baz"
@@ -380,6 +463,34 @@ def test_e4_rules_file(tmp_path):
     fs = run_lint(tmp_path)
     assert codes(fs) == ["E4"]
     assert fs[0].path == ".claude/rules/arch.md"
+
+
+def test_e4_ignores_rules_frontmatter(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, ".claude/rules/arch.md",
+          '---\ndescription: "see [gone](../../docs/kb/nope.md)"\n---\n\n'
+          "Read [a](../../docs/kb/a.md).\n")
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_e4_ignores_rules_frontmatter_closer_on_last_line(tmp_path):
+    # Rules files get no E1, so a bogus E4 here would fail --strict with no
+    # diagnostic explaining it.
+    bundle_two_pages(tmp_path)
+    write(tmp_path, ".claude/rules/arch.md",
+          "---\ntitle: Arch: rules\n"
+          'description: "see [gone](../../docs/kb/nope.md)"\n---\n')
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_rules_frontmatter_reference_does_not_prevent_orphan(tmp_path):
+    # A link inside frontmatter is metadata, not a reference, so it must not
+    # keep a page out of W2. Intended consequence of body scoping.
+    make_repo(tmp_path, {"docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+                         "docs/kb/orphan.md": PAGE})
+    write(tmp_path, ".claude/rules/arch.md",
+          '---\ndescription: "see [o](../../docs/kb/orphan.md)"\n---\n\nBody.\n')
+    assert codes(run_lint(tmp_path)) == ["W1", "W2"]
 
 
 def test_e4_at_import_fallback_to_repo_root(tmp_path):
@@ -485,6 +596,15 @@ def test_w4_valid_log_descending(tmp_path):
     make_repo(tmp_path, {
         "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
         "docs/kb/log.md": "# Log\n\n## 2026-07-02\n* **B**: y.\n\n## 2026-06-01\n* **A**: x.\n",
+    })
+    assert codes(run_lint(tmp_path)) == []
+
+
+def test_w4_ignores_frontmatter_hash_line(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+        "docs/kb/log.md": "---\ntitle: Log\n## not a date\n---\n\n# Log\n\n"
+                          "## 2026-07-02\n* **B**: y.\n",
     })
     assert codes(run_lint(tmp_path)) == []
 

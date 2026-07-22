@@ -59,6 +59,8 @@ Pick self-explanatory names for new types; never leave `type` empty.
 - NEVER wikilinks `[[...]]` (W5) — plain markdown only.
 - From CLAUDE.md / .claude/rules: normal relative markdown links or `@`-imports
   (`@docs/kb/page.md`); they are linted too (E4).
+- Links count only in the BODY: one inside YAML frontmatter (a `description:` value, say)
+  is metadata — never linted, and it does NOT satisfy W1/W2.
 - Every page must be reachable: listed in an index (W1) and linked from at least one other
   place (W2).
 
