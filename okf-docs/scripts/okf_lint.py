@@ -160,17 +160,20 @@ def parse_frontmatter(text: str) -> tuple[dict | None, int, str | None, int]:
 
 
 def body_text(text: str) -> str:
-    """Text with the frontmatter block blanked out, keeping the line count.
+    """Text with the frontmatter block blanked out.
 
     Body checks must not see frontmatter: a link in a YAML value is not a body
-    link, and a '# ...' YAML comment is not a heading. Blanking rather than
-    slicing keeps reported line numbers absolute.
+    link, and a '# ...' YAML comment is not a heading. Frontmatter lines are
+    blanked rather than removed, so body findings keep absolute line numbers
+    (trailing blank lines may collapse, which no check depends on).
     """
-    start = parse_frontmatter(text)[1]
+    lines = text.splitlines()
+    meta, start, _, _ = parse_frontmatter(text)
     if start <= 1:
-        return text
-    return "\n".join("" if i < start else line
-                     for i, line in enumerate(text.splitlines(), 1))
+        return text  # no frontmatter block at all
+    if meta is None and start > len(lines):
+        return text  # '---' never closed: not a block, so the file is all body
+    return "\n".join("" if i < start else line for i, line in enumerate(lines, 1))
 
 
 # ---------- links ----------
@@ -257,23 +260,29 @@ def target_exists(cand: Path) -> bool:
 
 
 def check_anchor(src_rel: str, line: int, frag: str, target_file: Path,
-                 texts: dict[Path, str], repo_root: Path) -> Finding | None:
+                 texts: dict[Path, str], slugs: dict[Path, set[str]],
+                 repo_root: Path) -> Finding | None:
     if not frag:
         return None
-    text = texts.get(target_file)
-    if text is None:
-        text, error = read_text(target_file)
-        if error:
-            return None
-        texts[target_file] = text
-    if slugify(frag) in heading_slugs(body_text(text)):
+    known = slugs.get(target_file)
+    if known is None:
+        text = texts.get(target_file)
+        if text is None:
+            text, error = read_text(target_file)
+            if error:
+                return None
+            texts[target_file] = text
+        known = heading_slugs(body_text(text))
+        slugs[target_file] = known
+    if slugify(frag) in known:
         return None
     return Finding(src_rel, line, "E6",
                    f"broken anchor '#{frag}' in link to '{rel(target_file, repo_root)}': no such heading")
 
 
 def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
-                       pages: list[Path], indexes: list[Path], logs: list[Path],
+                       slugs: dict[Path, set[str]], pages: list[Path],
+                       indexes: list[Path], logs: list[Path],
                        ) -> tuple[list[Finding], set[Path], set[Path]]:
     """Findings E3/E5/E6/W5 + (linked_targets, listed_by_index) resolved sets."""
     findings: list[Finding] = []
@@ -299,7 +308,7 @@ def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str
             if kind == "external":
                 continue
             if kind == "anchor":
-                f = check_anchor(src_rel, line_no, frag, src, texts, repo_root)
+                f = check_anchor(src_rel, line_no, frag, src, texts, slugs, repo_root)
                 if f:
                     findings.append(f)
                 continue
@@ -317,7 +326,7 @@ def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str
             if is_index:
                 listed_by_index.add(cand)
             if frag and cand.is_file() and cand.suffix == ".md":
-                f = check_anchor(src_rel, line_no, frag, cand, texts, repo_root)
+                f = check_anchor(src_rel, line_no, frag, cand, texts, slugs, repo_root)
                 if f:
                     findings.append(f)
 
@@ -355,6 +364,7 @@ def incoming_files(repo_root: Path) -> list[Path]:
 
 
 def check_incoming(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
+                   slugs: dict[Path, set[str]],
                    ) -> tuple[list[Finding], set[Path]]:
     """E4 for broken bundle references in CLAUDE.md/rules; E6 for their anchors."""
     findings: list[Finding] = []
@@ -365,7 +375,7 @@ def check_incoming(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
         if error:
             continue  # CLAUDE.md health is out of jurisdiction
         src_rel = rel(src, repo_root)
-        lines = strip_code(text)
+        lines = strip_code(body_text(text))
 
         for line_no, target in extract_links(lines):
             kind, path_part, frag = classify_target(target)
@@ -380,7 +390,7 @@ def check_incoming(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
                 continue
             incoming_targets.add(cand)
             if frag and cand.is_file() and cand.suffix == ".md":
-                f = check_anchor(src_rel, line_no, frag, cand, texts, repo_root)
+                f = check_anchor(src_rel, line_no, frag, cand, texts, slugs, repo_root)
                 if f:
                     findings.append(f)
 
@@ -478,6 +488,7 @@ def lint_bundle(repo_root: Path, bundle_root: Path) -> list[Finding]:
     findings: list[Finding] = []
     pages, indexes, logs = collect_bundle(bundle_root)
     texts: dict[Path, str] = {}
+    slugs: dict[Path, set[str]] = {}
 
     for f in pages + indexes + logs:
         text, error = read_text(f)
@@ -497,10 +508,10 @@ def lint_bundle(repo_root: Path, bundle_root: Path) -> list[Finding]:
             findings.extend(check_log(log, texts[log], repo_root))
 
     link_findings, linked_targets, listed_by_index = check_bundle_links(
-        repo_root, bundle_root, texts, pages, indexes, logs)
+        repo_root, bundle_root, texts, slugs, pages, indexes, logs)
     findings.extend(link_findings)
 
-    incoming_findings, incoming_targets = check_incoming(repo_root, bundle_root, texts)
+    incoming_findings, incoming_targets = check_incoming(repo_root, bundle_root, texts, slugs)
     findings.extend(incoming_findings)
 
     referenced = linked_targets | incoming_targets

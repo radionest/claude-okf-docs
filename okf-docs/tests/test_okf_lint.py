@@ -365,7 +365,22 @@ def test_frontmatter_comment_is_not_a_heading(tmp_path):
                         '# Setup\n---\n\n# Real\n\nx\n',
     })
     # #setup is broken: b.md has no "Setup" heading, only a YAML comment.
-    assert [f for f in run_lint(tmp_path) if f.code == "E6"]
+    fs = [f for f in run_lint(tmp_path) if f.code == "E6"]
+    assert len(fs) == 1
+    assert fs[0].path == "docs/kb/a.md" and fs[0].line == 7
+    assert "#setup" in fs[0].message
+
+
+def test_unterminated_frontmatter_does_not_blank_body(tmp_path):
+    # A '---' that never closes is not a frontmatter block; log.md has no E1
+    # path, so blanking it would drop every finding with no diagnostic.
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+        "docs/kb/log.md": "---\ntitle: Log\n\n# Log\n\n## not-a-date\n* **B**: y.\n",
+    })
+    fs = [f for f in run_lint(tmp_path) if f.code == "W4"]
+    assert len(fs) == 1
+    assert fs[0].line == 6 and "ISO" in fs[0].message
 
 
 def test_slugify_github_style():
@@ -409,6 +424,14 @@ def test_e4_rules_file(tmp_path):
     fs = run_lint(tmp_path)
     assert codes(fs) == ["E4"]
     assert fs[0].path == ".claude/rules/arch.md"
+
+
+def test_e4_ignores_rules_frontmatter(tmp_path):
+    bundle_two_pages(tmp_path)
+    write(tmp_path, ".claude/rules/arch.md",
+          '---\ndescription: "see [gone](../../docs/kb/nope.md)"\n---\n\n'
+          "Read [a](../../docs/kb/a.md).\n")
+    assert [f for f in run_lint(tmp_path) if f.code == "E4"] == []
 
 
 def test_e4_at_import_fallback_to_repo_root(tmp_path):
