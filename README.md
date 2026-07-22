@@ -49,8 +49,9 @@ E4 broken incoming link/@-import from CLAUDE.md or rules · E5 index entry to mi
 E6 broken `#anchor`. Warnings (exit 0, or 1 with `--strict`): W1 page not in any index ·
 W2 orphan page · W3 missing title/description · W4 log.md date issues · W5 wikilink.
 
-Only bodies are scanned: a link, `[[wikilink]]` or `@`-import inside YAML frontmatter is
-metadata, not a reference — it is never flagged, and never counts as an incoming link.
+References are scanned in bodies only: a link, `[[wikilink]]` or `@`-import inside YAML
+frontmatter is metadata, not a reference — it is never flagged, and never counts as an
+incoming link.
 
 ## Hooks
 
