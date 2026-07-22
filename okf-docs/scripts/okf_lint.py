@@ -132,48 +132,57 @@ def read_text(path: Path) -> tuple[str | None, str | None]:
         return None, f"cannot read file: {e}"
 
 
+def _fm_end(lines: list[str]) -> int:
+    """Index of the frontmatter block's closing '---', or -1 when it has none."""
+    if not lines or not FM_DELIM.match(lines[0]):
+        return -1
+    for i in range(1, len(lines)):
+        if FM_DELIM.match(lines[i]):
+            return i
+    return -1
+
+
 def parse_frontmatter(text: str) -> tuple[dict | None, int, str | None, int]:
-    """(meta, body_start_line, error, error_line).
+    """(meta, body_scan_from, error, error_line).
 
     meta is None when there is no frontmatter block at all; error is set when
     a block opener exists but the block is unterminated or not a YAML mapping.
-    body_start_line is 1 unless a *closed* block was found, so body checks scan
-    a file with a dangling '---' in full rather than discarding all of it.
+    body_scan_from is the first line body checks may read -- 1 unless a *closed*
+    block was found, so a file with a dangling '---' is scanned in full instead
+    of discarded. It is not the line the body semantically starts on.
     """
     lines = text.splitlines()
-    if not lines or not FM_DELIM.match(lines[0]):
+    end = _fm_end(lines)
+    if end < 0:
+        if lines and FM_DELIM.match(lines[0]):
+            return None, 1, "unterminated frontmatter block ('---' never closed)", 1
         return None, 1, None, 1
-    for i in range(1, len(lines)):
-        if FM_DELIM.match(lines[i]):
-            raw = "\n".join(lines[1:i])
-            try:
-                meta = yaml.safe_load(raw)
-            except yaml.YAMLError as e:
-                mark = getattr(e, "problem_mark", None)
-                err_line = 2 + (mark.line if mark else 0)
-                detail = getattr(e, "problem", None) or str(e).split("\n")[0]
-                return None, i + 2, f"frontmatter is not valid YAML: {detail}", err_line
-            if meta is None:
-                meta = {}
-            if not isinstance(meta, dict):
-                return None, i + 2, "frontmatter is not a YAML mapping", 2
-            return meta, i + 2, None, 1
-    return None, 1, "unterminated frontmatter block ('---' never closed)", 1
+    try:
+        meta = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        err_line = 2 + (mark.line if mark else 0)
+        detail = getattr(e, "problem", None) or str(e).split("\n")[0]
+        return None, end + 2, f"frontmatter is not valid YAML: {detail}", err_line
+    if meta is None:
+        meta = {}
+    if not isinstance(meta, dict):
+        return None, end + 2, "frontmatter is not a YAML mapping", 2
+    return meta, end + 2, None, 1
 
 
-def body_text(text: str) -> str:
-    """Text with the frontmatter block blanked out.
+def body_lines(text: str) -> list[str]:
+    """File lines with the frontmatter block blanked out, line count preserved.
 
     Body checks must not see frontmatter: a link in a YAML value is not a body
-    link, and a '# ...' YAML comment is not a heading. Frontmatter lines are
-    blanked rather than removed, so body findings keep absolute line numbers
-    (trailing blank lines may collapse, which no check depends on).
+    link, and a '# ...' YAML comment is not a heading. Blanking rather than
+    dropping keeps body findings on their absolute line numbers.
     """
-    start = parse_frontmatter(text)[1]
-    if start <= 1:
-        return text  # no closed block: nothing is frontmatter, the file is body
-    return "\n".join("" if i < start else line
-                     for i, line in enumerate(text.splitlines(), 1))
+    lines = text.splitlines()
+    end = _fm_end(lines)
+    if end < 0:
+        return lines  # no closed block: nothing is frontmatter, the file is body
+    return ["" if i <= end else line for i, line in enumerate(lines)]
 
 
 # ---------- links ----------
@@ -185,11 +194,11 @@ HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
 
 
-def strip_code(text: str) -> list[str]:
+def strip_code(lines: list[str]) -> list[str]:
     """Blank fenced blocks and inline code spans; keep the line count."""
     out: list[str] = []
     in_fence = False
-    for line in text.splitlines():
+    for line in lines:
         if FENCE.match(line):
             in_fence = not in_fence
             out.append("")
@@ -232,11 +241,11 @@ def slugify(text: str) -> str:
     return re.sub(r"\s", "-", s.strip())  # each whitespace char -> '-', GitHub-style
 
 
-def heading_slugs(text: str) -> set[str]:
+def heading_slugs(lines: list[str]) -> set[str]:
     seen: dict[str, int] = {}
     slugs: set[str] = set()
     in_fence = False
-    for line in text.splitlines():
+    for line in lines:
         if FENCE.match(line):
             in_fence = not in_fence
             continue
@@ -259,30 +268,38 @@ def target_exists(cand: Path) -> bool:
         return False
 
 
-def check_anchor(src_rel: str, line: int, frag: str, target_file: Path,
-                 texts: dict[Path, str], slugs: dict[Path, set[str]],
-                 repo_root: Path) -> Finding | None:
+@dataclass
+class Ctx:
+    """Roots and per-run caches shared by the link checks."""
+    repo_root: Path
+    bundle_root: Path
+    texts: dict[Path, str]       # path -> file text
+    slugs: dict[Path, set[str]]  # path -> body heading slugs
+
+
+def check_anchor(ctx: Ctx, src_rel: str, line: int, frag: str,
+                 target_file: Path) -> Finding | None:
     if not frag:
         return None
-    known = slugs.get(target_file)
+    known = ctx.slugs.get(target_file)
     if known is None:
-        text = texts.get(target_file)
+        text = ctx.texts.get(target_file)
         if text is None:
             text, error = read_text(target_file)
             if error:
                 return None
-            texts[target_file] = text
-        known = heading_slugs(body_text(text))
-        slugs[target_file] = known
+            ctx.texts[target_file] = text
+        known = heading_slugs(body_lines(text))
+        ctx.slugs[target_file] = known
     if slugify(frag) in known:
         return None
     return Finding(src_rel, line, "E6",
-                   f"broken anchor '#{frag}' in link to '{rel(target_file, repo_root)}': no such heading")
+                   f"broken anchor '#{frag}' in link to "
+                   f"'{rel(target_file, ctx.repo_root)}': no such heading")
 
 
-def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
-                       slugs: dict[Path, set[str]], pages: list[Path],
-                       indexes: list[Path], logs: list[Path],
+def check_bundle_links(ctx: Ctx, pages: list[Path], indexes: list[Path],
+                       logs: list[Path],
                        ) -> tuple[list[Finding], set[Path], set[Path]]:
     """Findings E3/E5/E6/W5 + (linked_targets, listed_by_index) resolved sets."""
     findings: list[Finding] = []
@@ -290,14 +307,14 @@ def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str
     listed_by_index: set[Path] = set()
 
     for src in pages + logs + indexes:
-        text = texts.get(src)
+        text = ctx.texts.get(src)
         if text is None:
             continue
-        src_rel = rel(src, repo_root)
+        src_rel = rel(src, ctx.repo_root)
         is_index = src.name == "index.md"
         code = "E5" if is_index else "E3"
         noun = "index entry links to" if is_index else "broken link:"
-        lines = strip_code(body_text(text))
+        lines = strip_code(body_lines(text))
 
         for line_no, raw in extract_wikilinks(lines):
             findings.append(Finding(src_rel, line_no, "W5",
@@ -308,15 +325,15 @@ def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str
             if kind == "external":
                 continue
             if kind == "anchor":
-                f = check_anchor(src_rel, line_no, frag, src, texts, slugs, repo_root)
+                f = check_anchor(ctx, src_rel, line_no, frag, src)
                 if f:
                     findings.append(f)
                 continue
             if kind == "absolute":
-                cand = (bundle_root / path_part.lstrip("/")).resolve()
+                cand = (ctx.bundle_root / path_part.lstrip("/")).resolve()
             else:
                 cand = (src.parent / path_part).resolve()
-            if not cand.is_relative_to(bundle_root):
+            if not cand.is_relative_to(ctx.bundle_root):
                 continue  # out of jurisdiction
             if not target_exists(cand):
                 findings.append(Finding(src_rel, line_no, code,
@@ -326,7 +343,7 @@ def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str
             if is_index:
                 listed_by_index.add(cand)
             if frag and cand.is_file() and cand.suffix == ".md":
-                f = check_anchor(src_rel, line_no, frag, cand, texts, slugs, repo_root)
+                f = check_anchor(ctx, src_rel, line_no, frag, cand)
                 if f:
                     findings.append(f)
 
@@ -363,26 +380,24 @@ def incoming_files(repo_root: Path) -> list[Path]:
     return sorted(files)
 
 
-def check_incoming(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
-                   slugs: dict[Path, set[str]],
-                   ) -> tuple[list[Finding], set[Path]]:
+def check_incoming(ctx: Ctx) -> tuple[list[Finding], set[Path]]:
     """E4 for broken bundle references in CLAUDE.md/rules; E6 for their anchors."""
     findings: list[Finding] = []
     incoming_targets: set[Path] = set()
 
-    for src in incoming_files(repo_root):
+    for src in incoming_files(ctx.repo_root):
         text, error = read_text(src)
         if error:
             continue  # CLAUDE.md health is out of jurisdiction
-        src_rel = rel(src, repo_root)
-        lines = strip_code(body_text(text))
+        src_rel = rel(src, ctx.repo_root)
+        lines = strip_code(body_lines(text))
 
         for line_no, target in extract_links(lines):
             kind, path_part, frag = classify_target(target)
             if kind != "relative":
                 continue  # external/anchor/leading-'/' have no bundle semantics here
             cand = (src.parent / path_part).resolve()
-            if not cand.is_relative_to(bundle_root):
+            if not cand.is_relative_to(ctx.bundle_root):
                 continue
             if not target_exists(cand):
                 findings.append(Finding(src_rel, line_no, "E4",
@@ -390,19 +405,20 @@ def check_incoming(repo_root: Path, bundle_root: Path, texts: dict[Path, str],
                 continue
             incoming_targets.add(cand)
             if frag and cand.is_file() and cand.suffix == ".md":
-                f = check_anchor(src_rel, line_no, frag, cand, texts, slugs, repo_root)
+                f = check_anchor(ctx, src_rel, line_no, frag, cand)
                 if f:
                     findings.append(f)
 
         for line_no, imp in extract_at_imports(lines):
             if imp.startswith("~"):
                 continue
-            candidates = [(src.parent / imp).resolve(), (repo_root / imp).resolve()]
+            candidates = [(src.parent / imp).resolve(), (ctx.repo_root / imp).resolve()]
             existing = [c for c in candidates if target_exists(c)]
             if existing:
-                incoming_targets.update(c for c in existing if c.is_relative_to(bundle_root))
+                incoming_targets.update(c for c in existing
+                                        if c.is_relative_to(ctx.bundle_root))
                 continue
-            if any(c.is_relative_to(bundle_root) for c in candidates):
+            if any(c.is_relative_to(ctx.bundle_root) for c in candidates):
                 findings.append(Finding(src_rel, line_no, "E4",
                                         f"broken @-import '@{imp}': target does not exist"))
 
@@ -421,7 +437,7 @@ def check_log(log_path: Path, text: str, repo_root: Path) -> list[Finding]:
     p = rel(log_path, repo_root)
     prev: date | None = None
     in_fence = False
-    for i, line in enumerate(body_text(text).splitlines(), 1):
+    for i, line in enumerate(body_lines(text), 1):
         if FENCE.match(line):
             in_fence = not in_fence
             continue
@@ -507,11 +523,12 @@ def lint_bundle(repo_root: Path, bundle_root: Path) -> list[Finding]:
         if log in texts:
             findings.extend(check_log(log, texts[log], repo_root))
 
+    ctx = Ctx(repo_root, bundle_root, texts, slugs)
     link_findings, linked_targets, listed_by_index = check_bundle_links(
-        repo_root, bundle_root, texts, slugs, pages, indexes, logs)
+        ctx, pages, indexes, logs)
     findings.extend(link_findings)
 
-    incoming_findings, incoming_targets = check_incoming(repo_root, bundle_root, texts, slugs)
+    incoming_findings, incoming_targets = check_incoming(ctx)
     findings.extend(incoming_findings)
 
     referenced = linked_targets | incoming_targets

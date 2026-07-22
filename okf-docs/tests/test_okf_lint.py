@@ -345,7 +345,7 @@ def test_frontmatter_value_is_not_a_body_link(tmp_path):
         "docs/kb/auth.md": '---\ntype: Concept\ntitle: A\n'
                            'description: "see [x](/gone.md)"\n---\n\n# A\n\nbody\n',
     })
-    assert [f for f in run_lint(tmp_path) if f.code == "E3"] == []
+    assert codes(run_lint(tmp_path)) == []
 
 
 def test_frontmatter_value_is_not_a_wikilink(tmp_path):
@@ -354,7 +354,7 @@ def test_frontmatter_value_is_not_a_wikilink(tmp_path):
         "docs/kb/auth.md": '---\ntype: Concept\ntitle: A\n'
                            'description: "see [[Other Page]]"\n---\n\n# A\n\nbody\n',
     })
-    assert [f for f in run_lint(tmp_path) if f.code == "W5"] == []
+    assert codes(run_lint(tmp_path)) == []
 
 
 def test_frontmatter_comment_is_not_a_heading(tmp_path):
@@ -365,8 +365,8 @@ def test_frontmatter_comment_is_not_a_heading(tmp_path):
                         '# Setup\n---\n\n# Real\n\nx\n',
     })
     # #setup is broken: b.md has no "Setup" heading, only a YAML comment.
-    fs = [f for f in run_lint(tmp_path) if f.code == "E6"]
-    assert len(fs) == 1
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["E6"]
     assert fs[0].path == "docs/kb/a.md" and fs[0].line == 7
     assert "#setup" in fs[0].message
 
@@ -378,23 +378,24 @@ def test_unterminated_frontmatter_does_not_blank_body(tmp_path):
         "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
         "docs/kb/log.md": "---\ntitle: Log\n\n# Log\n\n## not-a-date\n* **B**: y.\n",
     })
-    fs = [f for f in run_lint(tmp_path) if f.code == "W4"]
-    assert len(fs) == 1
+    fs = run_lint(tmp_path)
+    assert codes(fs) == ["W4"]
     assert fs[0].line == 6 and "ISO" in fs[0].message
 
 
-def test_body_text_branches():
+def test_body_lines_branches():
     # no frontmatter at all: unchanged
-    assert M.body_text("# H\n\ntext\n") == "# H\n\ntext\n"
+    assert M.body_lines("# H\n\ntext\n") == ["# H", "", "text"]
     # valid block: frontmatter blanked, body keeps its absolute line number
-    valid = M.body_text("---\nt: 1\n---\n\n# H\n").splitlines()
-    assert valid[:4] == ["", "", "", ""] and valid[4] == "# H"
+    assert M.body_lines("---\nt: 1\n---\n\n# H\n") == ["", "", "", "", "# H"]
+    # body on the line right after the closer: nothing blanked past it
+    assert M.body_lines("---\nt: 1\n---\n# H\n") == ["", "", "", "# H"]
     # '---' never closed: not a block, so the whole file is body
-    assert M.body_text("---\nt: 1\n\n# H\n") == "---\nt: 1\n\n# H\n"
+    assert M.body_lines("---\nt: 1\n\n# H\n") == ["---", "t: 1", "", "# H"]
     # bad YAML, closer mid-file: still a block
-    assert M.body_text("---\nt: [bad\n---\n\n# H\n").splitlines()[4] == "# H"
+    assert M.body_lines("---\nt: [bad\n---\n\n# H\n") == ["", "", "", "", "# H"]
     # bad YAML, closer on the last line: still a block, nothing survives
-    assert M.body_text("---\nt: [bad\n---\n").strip() == ""
+    assert M.body_lines("---\nt: [bad\n---\n") == ["", "", ""]
 
 
 def test_bad_yaml_with_closer_on_last_line_is_still_frontmatter(tmp_path):
@@ -456,7 +457,7 @@ def test_e4_ignores_rules_frontmatter(tmp_path):
     write(tmp_path, ".claude/rules/arch.md",
           '---\ndescription: "see [gone](../../docs/kb/nope.md)"\n---\n\n'
           "Read [a](../../docs/kb/a.md).\n")
-    assert [f for f in run_lint(tmp_path) if f.code == "E4"] == []
+    assert codes(run_lint(tmp_path)) == []
 
 
 def test_e4_ignores_rules_frontmatter_closer_on_last_line(tmp_path):
@@ -466,7 +467,7 @@ def test_e4_ignores_rules_frontmatter_closer_on_last_line(tmp_path):
     write(tmp_path, ".claude/rules/arch.md",
           "---\ntitle: Arch: rules\n"
           'description: "see [gone](../../docs/kb/nope.md)"\n---\n')
-    assert [f for f in run_lint(tmp_path) if f.code == "E4"] == []
+    assert codes(run_lint(tmp_path)) == []
 
 
 def test_rules_frontmatter_reference_does_not_prevent_orphan(tmp_path):
@@ -592,7 +593,7 @@ def test_w4_ignores_frontmatter_hash_line(tmp_path):
         "docs/kb/log.md": "---\ntitle: Log\n## not a date\n---\n\n# Log\n\n"
                           "## 2026-07-02\n* **B**: y.\n",
     })
-    assert [f for f in run_lint(tmp_path) if f.code == "W4"] == []
+    assert codes(run_lint(tmp_path)) == []
 
 
 def test_empty_bundle_only_index_is_clean(tmp_path):
