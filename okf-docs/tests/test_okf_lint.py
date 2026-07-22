@@ -383,6 +383,19 @@ def test_unterminated_frontmatter_does_not_blank_body(tmp_path):
     assert fs[0].line == 6 and "ISO" in fs[0].message
 
 
+def test_fm_end():
+    # a '---' with no opener above it is a thematic break, not a closer
+    assert M._fm_end(["# H", "---", "text"]) == -1
+    # the FIRST closer ends the block; a later '---' is body
+    assert M._fm_end(["---", "a: 1", "---", "text", "---"]) == 2
+    # opener never closed
+    assert M._fm_end(["---", "a: 1", "text"]) == -1
+    assert M._fm_end(["---"]) == -1
+    assert M._fm_end([]) == -1
+    # closer on the final line
+    assert M._fm_end(["---", "a: 1", "---"]) == 2
+
+
 def test_body_lines_branches():
     # no frontmatter at all: unchanged
     assert M.body_lines("# H\n\ntext\n") == ["# H", "", "text"]

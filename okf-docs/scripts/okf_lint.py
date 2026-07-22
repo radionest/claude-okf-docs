@@ -142,33 +142,31 @@ def _fm_end(lines: list[str]) -> int:
     return -1
 
 
-def parse_frontmatter(text: str) -> tuple[dict | None, int, str | None, int]:
-    """(meta, body_scan_from, error, error_line).
+def parse_frontmatter(text: str) -> tuple[dict | None, str | None, int]:
+    """(meta, error, error_line).
 
     meta is None when there is no frontmatter block at all; error is set when
     a block opener exists but the block is unterminated or not a YAML mapping.
-    body_scan_from is the first line body checks may read -- 1 unless a *closed*
-    block was found, so a file with a dangling '---' is scanned in full instead
-    of discarded. It is not the line the body semantically starts on.
+    Where the body starts is _fm_end's business, not this function's.
     """
     lines = text.splitlines()
     end = _fm_end(lines)
     if end < 0:
         if lines and FM_DELIM.match(lines[0]):
-            return None, 1, "unterminated frontmatter block ('---' never closed)", 1
-        return None, 1, None, 1
+            return None, "unterminated frontmatter block ('---' never closed)", 1
+        return None, None, 1
     try:
         meta = yaml.safe_load("\n".join(lines[1:end]))
     except yaml.YAMLError as e:
         mark = getattr(e, "problem_mark", None)
         err_line = 2 + (mark.line if mark else 0)
         detail = getattr(e, "problem", None) or str(e).split("\n")[0]
-        return None, end + 2, f"frontmatter is not valid YAML: {detail}", err_line
+        return None, f"frontmatter is not valid YAML: {detail}", err_line
     if meta is None:
         meta = {}
     if not isinstance(meta, dict):
-        return None, end + 2, "frontmatter is not a YAML mapping", 2
-    return meta, end + 2, None, 1
+        return None, "frontmatter is not a YAML mapping", 2
+    return meta, None, 1
 
 
 def body_lines(text: str) -> list[str]:
@@ -465,7 +463,7 @@ def check_log(log_path: Path, text: str, repo_root: Path) -> list[Finding]:
 def check_page_frontmatter(page: Path, text: str, repo_root: Path) -> list[Finding]:
     findings: list[Finding] = []
     p = rel(page, repo_root)
-    meta, _, error, err_line = parse_frontmatter(text)
+    meta, error, err_line = parse_frontmatter(text)
     if error:
         return [Finding(p, err_line, "E1", error)]
     if meta is None:
@@ -485,7 +483,7 @@ def check_index_frontmatter(index: Path, text: str, repo_root: Path,
                             bundle_root: Path) -> list[Finding]:
     p = rel(index, repo_root)
     is_root = index.parent == bundle_root
-    meta, _, error, err_line = parse_frontmatter(text)
+    meta, error, err_line = parse_frontmatter(text)
     if error:
         return [Finding(p, err_line, "E1", error)]
     if meta is None:
