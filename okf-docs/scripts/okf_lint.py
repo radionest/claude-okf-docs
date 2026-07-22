@@ -159,6 +159,20 @@ def parse_frontmatter(text: str) -> tuple[dict | None, int, str | None, int]:
     return None, len(lines) + 1, "unterminated frontmatter block ('---' never closed)", 1
 
 
+def body_text(text: str) -> str:
+    """Text with the frontmatter block blanked out, keeping the line count.
+
+    Body checks must not see frontmatter: a link in a YAML value is not a body
+    link, and a '# ...' YAML comment is not a heading. Blanking rather than
+    slicing keeps reported line numbers absolute.
+    """
+    start = parse_frontmatter(text)[1]
+    if start <= 1:
+        return text
+    return "\n".join("" if i < start else line
+                     for i, line in enumerate(text.splitlines(), 1))
+
+
 # ---------- links ----------
 
 FENCE = re.compile(r"^\s*(```|~~~)")
@@ -252,7 +266,7 @@ def check_anchor(src_rel: str, line: int, frag: str, target_file: Path,
         if error:
             return None
         texts[target_file] = text
-    if slugify(frag) in heading_slugs(text):
+    if slugify(frag) in heading_slugs(body_text(text)):
         return None
     return Finding(src_rel, line, "E6",
                    f"broken anchor '#{frag}' in link to '{rel(target_file, repo_root)}': no such heading")
@@ -274,7 +288,7 @@ def check_bundle_links(repo_root: Path, bundle_root: Path, texts: dict[Path, str
         is_index = src.name == "index.md"
         code = "E5" if is_index else "E3"
         noun = "index entry links to" if is_index else "broken link:"
-        lines = strip_code(text)
+        lines = strip_code(body_text(text))
 
         for line_no, raw in extract_wikilinks(lines):
             findings.append(Finding(src_rel, line_no, "W5",
@@ -397,7 +411,7 @@ def check_log(log_path: Path, text: str, repo_root: Path) -> list[Finding]:
     p = rel(log_path, repo_root)
     prev: date | None = None
     in_fence = False
-    for i, line in enumerate(text.splitlines(), 1):
+    for i, line in enumerate(body_text(text).splitlines(), 1):
         if FENCE.match(line):
             in_fence = not in_fence
             continue

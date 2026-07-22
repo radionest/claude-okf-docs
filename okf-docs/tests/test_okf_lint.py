@@ -339,6 +339,35 @@ def test_w5_wikilink(tmp_path):
     assert "[[Other Page]]" in fs[0].message
 
 
+def test_frontmatter_value_is_not_a_body_link(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": '---\ntype: Concept\ntitle: A\n'
+                           'description: "see [x](/gone.md)"\n---\n\n# A\n\nbody\n',
+    })
+    assert [f for f in run_lint(tmp_path) if f.code == "E3"] == []
+
+
+def test_frontmatter_value_is_not_a_wikilink(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX,
+        "docs/kb/auth.md": '---\ntype: Concept\ntitle: A\n'
+                           'description: "see [[Other Page]]"\n---\n\n# A\n\nbody\n',
+    })
+    assert [f for f in run_lint(tmp_path) if f.code == "W5"] == []
+
+
+def test_frontmatter_comment_is_not_a_heading(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": "# B\n\n* [A](/a.md) - a.\n* [B](/b.md) - b.\n",
+        "docs/kb/a.md": page("Link [s](/b.md#setup)."),
+        "docs/kb/b.md": '---\ntype: Concept\ntitle: B\ndescription: d.\n'
+                        '# Setup\n---\n\n# Real\n\nx\n',
+    })
+    # #setup is broken: b.md has no "Setup" heading, only a YAML comment.
+    assert [f for f in run_lint(tmp_path) if f.code == "E6"]
+
+
 def test_slugify_github_style():
     assert M.slugify("Setup & Run") == "setup--run"
     assert M.slugify("Foo `bar` Baz") == "foo-bar-baz"
@@ -487,6 +516,15 @@ def test_w4_valid_log_descending(tmp_path):
         "docs/kb/log.md": "# Log\n\n## 2026-07-02\n* **B**: y.\n\n## 2026-06-01\n* **A**: x.\n",
     })
     assert codes(run_lint(tmp_path)) == []
+
+
+def test_w4_ignores_frontmatter_hash_line(tmp_path):
+    make_repo(tmp_path, {
+        "docs/kb/index.md": ROOT_INDEX, "docs/kb/auth.md": PAGE,
+        "docs/kb/log.md": "---\ntitle: Log\n## not a date\n---\n\n# Log\n\n"
+                          "## 2026-07-02\n* **B**: y.\n",
+    })
+    assert [f for f in run_lint(tmp_path) if f.code == "W4"] == []
 
 
 def test_empty_bundle_only_index_is_clean(tmp_path):
